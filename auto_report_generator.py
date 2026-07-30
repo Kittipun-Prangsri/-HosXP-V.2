@@ -133,7 +133,8 @@ def validate_sql_query(sql):
     
     for kw in forbidden_keywords:
         if re.search(kw, cleaned):
-            return False, f"พบคำสั่งต้องห้าม ({kw.replace(r'\b', '')}) ซึ่งไม่อนุญาตให้รันเพื่อความปลอดภัยสูงสุดของฐานข้อมูลโรงพยาบาล"
+            clean_kw = kw.replace(r'\b', '')
+            return False, f"พบคำสั่งต้องห้าม ({clean_kw}) ซึ่งไม่อนุญาตให้รันเพื่อความปลอดภัยสูงสุดของฐานข้อมูลโรงพยาบาล"
             
     return True, None
 

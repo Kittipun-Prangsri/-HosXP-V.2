@@ -41,17 +41,15 @@ def load_env():
                         pass
 
 load_env()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+    GEMINI_API_KEY = "AIzaSyC9mtcdLNDLiAm6FZ1sMpP0mS-CVbJDgVI"
+
 DB_HOST = os.environ.get("HOSXP_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("HOSXP_DB_PORT", "3306"))
 DB_NAME = os.environ.get("HOSXP_DB_NAME", "hosxp")
 DB_USER = os.environ.get("HOSXP_DB_USER", "root")
 DB_PASS = os.environ.get("HOSXP_DB_PASS", "")
-
-if not GEMINI_API_KEY:
-    print(f"{Colors.WARNING}⚠️ ไม่พบ GEMINI_API_KEY ในไฟล์ .env{Colors.ENDC}")
-    print(f"กรุณาใส่ API Key ของคุณในไฟล์ .env เพื่อใช้ระบบแปลภาษาเป็น SQL")
-    sys.exit(1)
 
 # ตั้งค่าเชื่อมต่อ Google Gemini
 genai.configure(api_key=GEMINI_API_KEY)

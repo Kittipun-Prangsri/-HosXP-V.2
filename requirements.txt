@@ -3,3 +3,5 @@ mysql-connector-python
 pandas
 openpyxl
 requests
+google-generativeai
+pillow

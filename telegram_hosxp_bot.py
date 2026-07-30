@@ -17,8 +17,13 @@ if os.path.exists(".env"):
                     pass
 
 # 2. ตั้งค่าดึงข้อมูล API Keys (ดึงจาก env หรือใช้ค่าเริ่มต้นจากเครื่องของคุณ)
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8861354099:AAH2g-fFEqJ4J105542KrTrImnIe-vKFQNM")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyC9mtcdLNDLiAm6FZ1sMpP0mS-CVbJDgVI")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "your_telegram_bot_token_here":
+    TELEGRAM_TOKEN = "8861354099:AAH2g-fFEqJ4J105542KrTrImnIe-vKFQNM"
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+    GEMINI_API_KEY = "AIzaSyC9mtcdLNDLiAm6FZ1sMpP0mS-CVbJDgVI"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     print("⚠️ คำเตือน: กรุณาตั้งค่า Environment Variables: TELEGRAM_BOT_TOKEN และ GEMINI_API_KEY")
