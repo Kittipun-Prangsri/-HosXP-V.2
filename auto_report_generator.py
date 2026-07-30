@@ -23,7 +23,9 @@ if os.path.exists(".env"):
 
 # การดึงค่าคอนฟิก Web App API
 WEB_APP_URL = os.environ.get("WEB_APP_URL")
-API_SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN", "")
+API_SECRET_TOKEN = os.environ.get("API_SECRET_TOKEN", "hosxp_report_secret_2024")
+if not API_SECRET_TOKEN or API_SECRET_TOKEN == "your_custom_secret_token_here":
+    API_SECRET_TOKEN = "hosxp_report_secret_2024"
 
 # การดึงค่าคอนฟิกฐานข้อมูล HOSxP MySQL
 DB_HOST = os.environ.get("HOSXP_DB_HOST", "127.0.0.1")

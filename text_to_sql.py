@@ -42,8 +42,10 @@ def load_env():
 
 load_env()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
-    GEMINI_API_KEY = "AIzaSyC9mtcdLNDLiAm6FZ1sMpP0mS-CVbJDgVI"
+if not GEMINI_API_KEY:
+    print(f"{Colors.WARNING}⚠️ ไม่พบ GEMINI_API_KEY ในไฟล์ .env{Colors.ENDC}")
+    print(f"กรุณาใส่ API Key ของคุณในไฟล์ .env เพื่อใช้ระบบแปลภาษาเป็น SQL")
+    sys.exit(1)
 
 DB_HOST = os.environ.get("HOSXP_DB_HOST", "127.0.0.1")
 DB_PORT = int(os.environ.get("HOSXP_DB_PORT", "3306"))
@@ -91,7 +93,7 @@ SELECT ...
 def generate_sql(prompt):
     """ส่งข้อความความต้องการไปวิเคราะห์ผ่าน Gemini AI"""
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
+        model = genai.GenerativeModel('gemini-2.0-flash-lite', system_instruction=SYSTEM_PROMPT)
         response = model.generate_content(prompt)
         text = response.text.strip()
         

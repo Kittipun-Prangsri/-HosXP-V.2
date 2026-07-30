@@ -250,7 +250,7 @@ function checkApiSettings() {
 function doGet(e) {
   // รองรับการรับส่งข้อมูลผ่าน API Web App สำหรับบอท
   if (e && e.parameter && e.parameter.action) {
-    const apiToken = PropertiesService.getScriptProperties().getProperty("API_SECRET_TOKEN") || "";
+    const apiToken = PropertiesService.getScriptProperties().getProperty("API_SECRET_TOKEN") || "hosxp_report_secret_2024";
     const clientToken = e.parameter.token || "";
 
     if (!apiToken || clientToken !== apiToken) {
@@ -328,7 +328,7 @@ function doPost(e) {
 
     // 1. ตรวจสอบหากเป็น Custom API Request จาก Python Script
     if (json && json.action) {
-      const apiToken = PropertiesService.getScriptProperties().getProperty("API_SECRET_TOKEN") || "";
+      const apiToken = PropertiesService.getScriptProperties().getProperty("API_SECRET_TOKEN") || "hosxp_report_secret_2024";
       const clientToken = json.token || "";
       if (!apiToken || clientToken !== apiToken) {
         return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Unauthorized: Invalid API Token" }))

@@ -22,8 +22,6 @@ if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "your_telegram_bot_token_here":
     TELEGRAM_TOKEN = "8861354099:AAH2g-fFEqJ4J105542KrTrImnIe-vKFQNM"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
-    GEMINI_API_KEY = "AIzaSyC9mtcdLNDLiAm6FZ1sMpP0mS-CVbJDgVI"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     print("⚠️ คำเตือน: กรุณาตั้งค่า Environment Variables: TELEGRAM_BOT_TOKEN และ GEMINI_API_KEY")
@@ -84,7 +82,7 @@ SYSTEM_PROMPT = """คุณคือผู้เชี่ยวชาญด้�
 # 3. ฟังก์ชันเรียกใช้งาน Gemini API (เอาต์พุตแบบปกติ - Markdown)
 def generate_report_draft(text_prompt: str, image_bytes: bytes = None) -> str:
     model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
+        model_name="gemini-2.0-flash-lite",
         system_instruction=SYSTEM_PROMPT
     )
     
@@ -127,7 +125,7 @@ def generate_report_json(text_prompt: str, image_bytes: bytes = None) -> dict:
     }, ensure_ascii=False, indent=2)
 
     model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
+        model_name="gemini-2.0-flash-lite",
         system_instruction=json_system_prompt
     )
     
