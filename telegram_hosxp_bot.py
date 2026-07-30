@@ -147,6 +147,27 @@ def generate_report_json(text_prompt: str, image_bytes: bytes = None) -> dict:
 
 # 4. จัดการเมื่อได้รับข้อความต้อนรับ
 if bot:
+    def send_long_message(chat_id, text):
+        """ส่งข้อความยาวโดยแบ่งส่วนแบบปลอดภัยและประมวลผล Markdown"""
+        if not text:
+            return
+        limit = 4000
+        if len(text) <= limit:
+            try:
+                bot.send_message(chat_id, text, parse_mode='Markdown')
+            except Exception as err:
+                print(f"⚠️ Markdown Error: {err}, falling back to plain text...")
+                bot.send_message(chat_id, text)
+            return
+
+        for x in range(0, len(text), limit):
+            chunk = text[x:x+limit]
+            try:
+                bot.send_message(chat_id, chunk, parse_mode='Markdown')
+            except Exception as err:
+                print(f"⚠️ Markdown Error in chunk: {err}, falling back to plain text...")
+                bot.send_message(chat_id, chunk)
+
     @bot.message_handler(commands=['start', 'help'])
     def send_welcome(message):
         welcome_text = (
@@ -168,13 +189,10 @@ if bot:
         try:
             result = generate_report_draft(text_prompt=user_query)
             
-            try:
-                bot.send_message(chat_id, result, parse_mode='Markdown')
-            except Exception as markdown_err:
-                print(f"⚠️ ไม่สามารถส่งในโหมด Markdown ได้ เนื่องจาก: {markdown_err} กำลังส่งแบบข้อความธรรมดาแทน...")
-                bot.send_message(chat_id, result)
-                
+            # ลบข้อความสถานะออกก่อนเพื่อความสะอาด
             bot.delete_message(chat_id, status_msg.message_id)
+            
+            send_long_message(chat_id, result)
             
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาดในระบบ: {e}")
@@ -189,7 +207,7 @@ if bot:
         chat_id = message.chat.id
         caption = message.caption
         
-        status_msg = bot.send_message(chat_id, "📸 ได้รับรูปภาพแล้ว กำลังสแกนฟอร์มและเขียนคำสั่ง SQL...")
+        status_msg = bot.send_message(chat_id, "📸 ได้รับรูปภาพแล้ว กำลังสแกนฟอร์มและเขียนคำสั่ง SQL... (ใช้เวลาวิเคราะห์ประมาณ 10-15 วินาที)")
         
         try:
             file_info = bot.get_file(message.photo[-1].file_id)
@@ -197,13 +215,10 @@ if bot:
             
             result = generate_report_draft(text_prompt=caption, image_bytes=downloaded_file)
             
-            try:
-                bot.send_message(chat_id, result, parse_mode='Markdown')
-            except Exception as markdown_err:
-                print(f"⚠️ ไม่สามารถส่งในโหมด Markdown ได้ เนื่องจาก: {markdown_err} กำลังส่งแบบข้อความธรรมดาแทน...")
-                bot.send_message(chat_id, result)
-                
+            # ลบข้อความสถานะออกก่อน
             bot.delete_message(chat_id, status_msg.message_id)
+            
+            send_long_message(chat_id, result)
             
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาดในระบบ: {e}")

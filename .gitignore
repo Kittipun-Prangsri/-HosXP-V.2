@@ -1,1 +1,6 @@
 .venv/
+.env
+__pycache__/
+Import/
+*.pyc
+completed_reports/

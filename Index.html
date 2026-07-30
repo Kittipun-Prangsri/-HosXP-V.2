@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HosXP Report</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Outfit:wght@300;400;500;600;700;800&family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <?!= include('Style'); ?>
 </head>
 <body>
@@ -36,7 +37,7 @@
 
     <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 12px; margin-bottom: 12px;">
       <input type="checkbox" id="login-remember" style="width: auto; cursor: pointer;">
-      <label for="login-remember" style="margin-bottom: 0; font-weight: 500; color: var(--gray-600); cursor: pointer; font-size: 13px;">จำชื่อผู้ใช้และรหัสผ่านในเครื่องนี้</label>
+      <label for="login-remember" style="margin-bottom: 0; font-weight: 500; color: var(--gray-600); cursor: pointer; font-size: 13px;">จำชื่อผู้ใช้ในเครื่องนี้</label>
     </div>
     
     <div id="login-error">⚠️ ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง</div>
@@ -71,6 +72,12 @@
           <span class="nav-icon">📋</span> คำขอรายงาน
         </div>
         <span id="nav-badge-pending" class="badge badge-pending" style="display: none; padding: 2px 8px; font-size: 11px;">0</span>
+      </div>
+      <div class="nav-item" data-page="inbox" style="display: flex; justify-content: space-between; align-items: center;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span class="nav-icon">📥</span> กล่องรับเข้าไฟล์
+        </div>
+        <span id="nav-badge-inbox" class="badge" style="display: none; padding: 2px 8px; font-size: 11px; background-color: var(--green); color: white; border-radius: 10px;">0</span>
       </div>
       <div class="nav-section">เครื่องมือ</div>
       <div class="nav-item" data-page="new-request">
@@ -111,8 +118,10 @@
         <div class="page-title" id="page-title">แดชบอร์ด</div>
       </div>
       <div class="topbar-actions">
+        <button class="btn btn-secondary btn-icon" id="theme-toggle-btn" title="สลับโหมดมืด/สว่าง" aria-label="สลับโหมดมืด/สว่าง">🌓</button>
+        <button class="btn btn-secondary btn-icon notification-btn" id="notification-btn" title="การแจ้งเตือน" aria-label="การแจ้งเตือน">🔔<span id="notification-count" class="notification-count" style="display:none">0</span></button>
         <button class="btn btn-primary btn-sm" id="topbar-new-btn">
-          ➕ สร้างคำขอใหม่
+          <span>➕</span><span class="btn-text"> สร้างคำขอใหม่</span>
         </button>
       </div>
     </header>
@@ -150,6 +159,25 @@
           </div>
         </div>
 
+        <!-- Charts Grid Card -->
+        <div class="card" style="margin-top: 16px;">
+          <div class="section-heading"><h3>📊 สถิติวิเคราะห์เชิงลึก (Interactive Charts)</h3></div>
+          <div class="charts-layout-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; padding: 12px 0;">
+            <div class="chart-box" style="position: relative; height: 260px; width: 100%; display: flex; flex-direction: column; align-items: center;">
+              <h4 style="font-size: 13px; font-weight: 700; color: var(--gray-600); margin-bottom: 8px;">สัดส่วนความเร่งด่วน</h4>
+              <div style="position: relative; height: 220px; width: 100%;">
+                <canvas id="urgencyChart"></canvas>
+              </div>
+            </div>
+            <div class="chart-box" style="position: relative; height: 260px; width: 100%; display: flex; flex-direction: column; align-items: center;">
+              <h4 style="font-size: 13px; font-weight: 700; color: var(--gray-600); margin-bottom: 8px;">แผนกที่มีคำขอสูงสุด (Top 5)</h4>
+              <div style="position: relative; height: 220px; width: 100%;">
+                <canvas id="departmentChart"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="recent-card">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid rgba(0, 0, 0, 0.05); padding-bottom: 12px;">
             <h3 style="margin-bottom: 0; border-bottom: none; padding-bottom: 0;">รายการล่าสุด (10 รายการ)</h3>
@@ -157,11 +185,22 @@
           </div>
           <div id="recent-list"></div>
         </div>
+
+        <div class="recent-card" id="action-queue-card">
+          <div class="section-heading"><div><h3>คิวที่ควรดำเนินการก่อน</h3><p>เรียงตามความเร่งด่วนและวันที่ต้องการรับรายงาน</p></div><button class="btn btn-secondary btn-sm" onclick="openActionQueue()">ดูทั้งหมด</button></div>
+          <div id="action-queue"></div>
+        </div>
       </div>
 
       <div class="page" id="page-requests">
         <div class="table-card">
           <div class="table-toolbar">
+            <div class="quick-filters" id="quick-filters">
+              <button class="quick-filter" data-quick-filter="mine">คำขอของฉัน</button>
+              <button class="quick-filter" data-quick-filter="pending">ยังไม่รับเรื่อง</button>
+              <button class="quick-filter" data-quick-filter="urgent">ด่วนมาก</button>
+              <button class="quick-filter" data-quick-filter="overdue">เกินกำหนด</button>
+            </div>
             <div class="report-controls" style="display: flex; gap: 10px; align-items: center; background: #fff; padding: 16px; border-radius: var(--radius); box-shadow: var(--shadow-sm); margin-bottom: 20px;">
               <span style="font-size: 13px; font-weight: 600; color: var(--gray-600);">สรุปรายงาน:</span>
               
@@ -205,6 +244,11 @@
             <select class="filter-select" id="filter-dept">
               <option value="">ทุกแผนก</option>
             </select>
+            <select class="filter-select" id="sort-requests" aria-label="เรียงลำดับรายการ">
+              <option value="created-desc">ใหม่ล่าสุด</option>
+              <option value="needed-asc">วันต้องการรับใกล้สุด</option>
+              <option value="urgency-desc">ความเร่งด่วนสูงสุด</option>
+            </select>
             <button class="btn btn-secondary btn-sm" id="refresh-btn">🔄 รีเฟรช</button>
           </div>
           <div class="table-wrap">
@@ -224,6 +268,19 @@
               <tbody id="requests-tbody"></tbody>
             </table>
           </div>
+          <div class="table-pagination" id="table-pagination"></div>
+        </div>
+      </div>
+
+      <div class="page" id="page-inbox">
+        <div class="table-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid rgba(0, 0, 0, 0.05); padding-bottom: 12px;">
+            <h3 style="margin-bottom: 0; color: var(--primary-dark); font-weight: 700; display: flex; align-items: center; gap: 8px;">📥 กล่องรับเข้าไฟล์รายงานเสร็จสิ้น</h3>
+            <button class="btn btn-secondary btn-sm" onclick="loadInbox()" style="min-height: auto; padding: 4px 10px;">🔄 รีเฟรช</button>
+          </div>
+          <div id="inbox-list" class="inbox-grid">
+            <!-- Items rendered by JavaScript -->
+          </div>
         </div>
       </div>
 
@@ -236,17 +293,17 @@
             
             <!-- Step Indicator -->
             <div class="steps" style="margin-bottom: 24px;">
-              <div class="step-item active" id="step1-indicator"><div class="step-num">1</div> ข้อมูลผู้ขอ</div>
+              <div class="step-item active" id="step1-indicator"><div class="step-num">1</div> <span class="step-label">ข้อมูลผู้ขอ</span></div>
               <div class="step-connector"></div>
-              <div class="step-item" id="step2-indicator"><div class="step-num">2</div> รายละเอียดรายงาน</div>
+              <div class="step-item" id="step2-indicator"><div class="step-num">2</div> <span class="step-label">รายละเอียดรายงาน</span></div>
               <div class="step-connector"></div>
-              <div class="step-item" id="step3-indicator"><div class="step-num">3</div> ส่งคำขอ</div>
+              <div class="step-item" id="step3-indicator"><div class="step-num">3</div> <span class="step-label">ส่งคำขอ</span></div>
             </div>
 
             <div id="new-req-form">
               <!-- Section 1: ข้อมูลผู้ขอรายงาน -->
               <div class="card" style="border:1px solid var(--gray-200); border-radius:var(--radius); padding:20px; margin-bottom:20px;">
-                <div class="section-label" style="font-size:11px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--green-600); margin-bottom:12px;">ข้อมูลผู้ขอรายงาน (ส่วนที่ 1)</div>
+                <div class="section-label" style="font-size:11px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--primary-dark); margin-bottom:12px;">ข้อมูลผู้ขอรายงาน (ส่วนที่ 1)</div>
                 <div class="form-row">
                   <div class="form-group">
                     <label for="nr-name">ชื่อ-นามสกุล <span class="req" style="color:var(--red);">*</span></label>
@@ -303,11 +360,17 @@
 
               <!-- Section 2: รายละเอียดรายงานที่ต้องการ -->
               <div class="card" style="border:1px solid var(--gray-200); border-radius:var(--radius); padding:20px; margin-bottom:20px;">
-                <div class="section-label" style="font-size:11px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--green-600); margin-bottom:12px;">รายละเอียดรายงานที่ต้องการ (ส่วนที่ 2)</div>
+                <div class="section-label" style="font-size:11px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--primary-dark); margin-bottom:12px;">รายละเอียดรายงานที่ต้องการ (ส่วนที่ 2)</div>
 
-                <div class="form-group">
-                  <label for="nr-type">ชื่อรายงาน / หัวข้อที่ขอ <span class="req" style="color:var(--red);">*</span></label>
-                  <input type="text" id="nr-type" placeholder="เช่น รายงานสรุปผู้ป่วยนอก รายเดือน" />
+              <div class="form-group">
+                <label for="nr-type">ชื่อรายงาน / หัวข้อที่ขอ <span class="req" style="color:var(--red);">*</span></label>
+                <input type="text" id="nr-type" placeholder="เช่น รายงานสรุปผู้ป่วยนอก รายเดือน" />
+                <div class="field-help">เลือกตัวอย่างเพื่อเริ่มต้น แล้วแก้ไขให้ตรงกับงานของคุณ</div>
+                <div class="template-row" id="report-templates">
+                  <button type="button" class="chip template-btn" data-template="opd">สรุป OPD รายเดือน</button>
+                  <button type="button" class="chip template-btn" data-template="ipd">สรุป IPD รายเดือน</button>
+                  <button type="button" class="chip template-btn" data-template="custom">รายงานกำหนดเอง</button>
+                </div>
                 </div>
 
                 <div class="form-group">
@@ -358,7 +421,7 @@
 
               <!-- Section 3: รูปแบบและความเร่งด่วน -->
               <div class="card" style="border:1px solid var(--gray-200); border-radius:var(--radius); padding:20px; margin-bottom:20px;">
-                <div class="section-label" style="font-size:11px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--green-600); margin-bottom:12px;">รูปแบบและความเร่งด่วน (ส่วนที่ 3)</div>
+                <div class="section-label" style="font-size:11px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--primary-dark); margin-bottom:12px;">รูปแบบและความเร่งด่วน (ส่วนที่ 3)</div>
 
                 <div class="form-group">
                   <label>รูปแบบไฟล์ที่ต้องการ</label>
@@ -374,19 +437,19 @@
                 <div class="form-group" style="margin-top:14px">
                   <label>ระดับความเร่งด่วน <span class="req" style="color:var(--red);">*</span></label>
                   <div class="priority-grid">
-                    <div class="priority-card sel-low" id="nr-p-low" onclick="setFormPriority('ปกติ')">
+                    <div class="priority-card sel-low" id="nr-p-low" onclick="setFormPriority('ปกติ')" role="button" tabindex="0">
                       <div class="p-icon">🟢</div>
                       <div class="p-name">ปกติ</div>
                       <div class="p-desc">ภายใน 3–5 วัน</div>
                     </div>
-                    <div class="priority-card" id="nr-p-normal" onclick="setFormPriority('สูง')">
+                    <div class="priority-card" id="nr-p-normal" onclick="setFormPriority('สูง')" role="button" tabindex="0">
                       <div class="p-icon">🔵</div>
-                      <div class="p-name">เร่งด่วน</div>
+                      <div class="p-name">สูง</div>
                       <div class="p-desc">ภายใน 1–2 วัน</div>
                     </div>
-                    <div class="priority-card" id="nr-p-urgent" onclick="setFormPriority('เร่งด่วน')">
+                    <div class="priority-card" id="nr-p-urgent" onclick="setFormPriority('ด่วนที่สุด')" role="button" tabindex="0">
                       <div class="p-icon">🔴</div>
-                      <div class="p-name">ด่วนมาก</div>
+                      <div class="p-name">ด่วนที่สุด</div>
                       <div class="p-desc">ภายในวันนี้</div>
                     </div>
                   </div>
@@ -411,7 +474,7 @@
 
               <div style="display:flex;gap:10px;justify-content:flex-end">
                 <button class="btn btn-secondary" id="nr-reset-btn">ล้างข้อมูล</button>
-                <button class="btn btn-primary" id="nr-submit-btn">📤 ส่งคำขอรายงาน</button>
+                <button class="btn btn-primary" id="nr-submit-btn">ตรวจทานก่อนส่ง</button>
               </div>
             </div>
 
@@ -573,6 +636,21 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="modal-review">
+  <div class="modal modal-md">
+    <div class="modal-header"><h2>🔎 ตรวจทานคำขอ</h2><button class="close-btn" data-close="modal-review" aria-label="ปิด">✕</button></div>
+    <div class="modal-body"><p class="text-muted" style="margin-bottom:16px">ตรวจสอบข้อมูลก่อนส่งให้ทีมสารสนเทศ</p><div class="review-grid" id="review-content"></div></div>
+    <div class="modal-footer"><button class="btn btn-secondary" data-close="modal-review">กลับไปแก้ไข</button><button class="btn btn-primary" id="review-confirm-btn">📤 ยืนยันส่งคำขอ</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-notifications">
+  <div class="modal modal-sm">
+    <div class="modal-header"><h2>🔔 การแจ้งเตือน</h2><button class="close-btn" data-close="modal-notifications" aria-label="ปิด">✕</button></div>
+    <div class="modal-body"><div id="notification-list"></div></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="modal-detail">
   <div class="modal modal-lg">
     <div class="modal-header">
@@ -588,6 +666,37 @@
           🤖 ผลการวิเคราะห์และแนะนำ SQL โดย Gemini AI
         </h4>
         <div id="detail-ai-result" style="background: var(--gray-50); border: 1.5px solid var(--gray-200); border-radius: var(--radius-sm); padding: 16px; font-size: 14px; line-height: 1.6; position: relative; color: var(--gray-800); overflow: hidden;">
+        </div>
+      </div>
+
+      <!-- Admin Quick Upload & Complete Section -->
+      <div id="detail-admin-upload-section" class="admin-only" style="display: none; margin-top: 24px; border-top: 2px dashed var(--gray-200); padding-top: 20px;">
+        <h4 style="display: flex; align-items: center; gap: 8px; color: var(--primary-dark); font-size: 14.5px; margin-bottom: 12px; font-weight: 700;">
+          📤 อัปโหลดรายงานเสร็จสิ้น & ปิดงาน (Quick Complete)
+        </h4>
+        
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label for="detail-upload-admin-note" style="font-weight: 700; color: var(--gray-600);">หมายเหตุ Admin / ไอที ถึงผู้ร้องขอ (ถ้ามี)</label>
+          <textarea id="detail-upload-admin-note" placeholder="ระบุข้อความหรือหมายเหตุที่ต้องการแจ้งเตือนผู้ใช้งาน เช่น สรุปผลลัพธ์หรือระบุคอลัมน์สำคัญ..." style="min-height: 60px; width: 100%; border-radius: var(--radius-sm); border: 1.5px solid var(--gray-200); padding: 10px; font-family: inherit; font-size: 13.5px; outline: none; transition: var(--transition); background: rgba(255,255,255,0.5);"></textarea>
+        </div>
+
+        <div class="upload-dropzone" id="detail-upload-dropzone">
+          <input type="file" id="detail-upload-file-input" style="display: none;" accept=".xlsx,.xls,.csv,.pdf">
+          <div class="dz-message">
+            <span class="dz-icon" style="font-size: 32px; display: block; margin-bottom: 8px;">📊</span>
+            <p style="margin: 0 0 6px; font-weight: 700; font-size: 14px; color: var(--gray-800);">ลากไฟล์รายงาน Excel / PDF มาวางที่นี่ หรือคลิกเพื่ออัปโหลด</p>
+            <p style="margin: 0; font-size: 11.5px; color: var(--gray-400);">รองรับไฟล์ .xlsx, .xls, .csv, .pdf (ขนาดไม่เกิน 20MB)</p>
+          </div>
+        </div>
+
+        <div id="detail-upload-status" style="margin-top: 12px; display: none;">
+          <div style="display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 700; color: var(--blue); margin-bottom: 6px;">
+            <span id="detail-upload-status-text">⏳ กำลังอัปโหลดไฟล์...</span>
+            <span id="detail-upload-percent">0%</span>
+          </div>
+          <div class="upload-progress-wrap" style="height: 6px; background: var(--gray-100); border-radius: 3px; overflow: hidden;">
+            <div id="detail-upload-progress-bar" style="height: 100%; width: 0%; background: var(--primary-gradient); border-radius: 3px; transition: width 0.3s ease;"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -658,6 +767,17 @@
       <div class="form-group admin-only" id="ed-note-grp" style="display:none">
         <label>หมายเหตุ Admin / ไอที</label>
         <textarea id="ed-note" placeholder="หมายเหตุจากผู้ดูแลระบบ..."></textarea>
+      </div>
+      <div class="form-group admin-only" id="ed-file-grp" style="display:none; margin-top: 16px;">
+        <label>แนบไฟล์ผลลัพธ์ที่เสร็จแล้ว (อัปโหลดเข้า Google Drive)</label>
+        <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px;">
+          <input type="file" id="ed-file-upload-input" style="display: none;" accept=".xlsx,.xls,.csv,.pdf,image/*,.doc,.docx" onchange="handleAdminFileUpload(this)">
+          <button type="button" class="btn btn-secondary" onclick="document.getElementById('ed-file-upload-input').click()" style="white-space: nowrap; font-size: 13px; padding: 10px 14px; min-height: auto;">
+            📎 เลือกไฟล์...
+          </button>
+          <input type="text" id="ed-download-url" placeholder="ลิงก์ดาวน์โหลด (เช่น Google Drive, OneDrive หรืออัปโหลดระบบจะใส่ให้อัตโนมัติ)" style="flex: 1; font-size: 13.5px;">
+        </div>
+        <div id="ed-file-upload-status" style="font-size: 12px; font-weight: 600; display: none;"></div>
       </div>
     </div>
     <div class="modal-footer">

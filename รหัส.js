@@ -7,202 +7,307 @@
 const SHEET_NAME_REQUESTS = "Requests";
 const SHEET_NAME_USERS = "Users";
 const SHEET_NAME_LOGS = "Logs";
+const SHEET_NAME_HISTORY = "RequestHistory";
 
 const ADMIN_ROLE = "admin";
 const DOCTOR_ROLE = "doctor";
+const SESSION_TTL_SECONDS = 6 * 60 * 60;
 
-// 🚨 LINE OA CONFIGURATION (ใส่ค่าของคุณที่นี่)
-const LINE_ACCESS_TOKEN = "s0ueKkw86PCVQ/EdBVv2mM0SpJwaSCEIYi7u+jTA8A7xJtp0EPmmbBGprdVz8lv7sZnp7le48L+R6cjM2nJh7icNiOz/LIlaq7Z72ArjXxB/HZ8H2g4lt7qpmxtQq6rJH9jrfydfJPODklRMak1JxgdB04t89/1O/w1cDnyilFU=";
-const LINE_ADMIN_GROUP_ID = "Ud1ee9e2dd0d262fa7f6e6780f40df0c8";
-const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbw218gf5IZqOzkoilIZBpISRFQ4o9aH6_B9pxPJuf70FORyuNFEV4y7csTCcC7rYYbE/exec"; // สำหรับปุ่มกดใน LINE
+// 🚨 CONFIGURATION (ดึงข้อมูลจาก Script Properties เพื่อความปลอดภัย)
+const scriptProperties = PropertiesService.getScriptProperties();
 
-// 🚨 TELEGRAM CONFIGURATION (ใส่ค่าของคุณที่นี่)
-const TELEGRAM_BOT_TOKEN = "7931324702:AAGVf1TZ808MWdiVq3uVoNU3DKJ0Z8ppt00";
-const TELEGRAM_ADMIN_CHAT_ID = ""; // สามารถระบุ Chat ID ของกลุ่มแอดมินไอทีได้ (เช่น -100xxxxxxxxx หรือ ID ผู้ใช้)
+// LINE OA Config
+const LINE_ACCESS_TOKEN = scriptProperties.getProperty("LINE_ACCESS_TOKEN") || "";
+const LINE_ADMIN_GROUP_ID = scriptProperties.getProperty("LINE_ADMIN_GROUP_ID") || "Ud1ee9e2dd0d262fa7f6e6780f40df0c8";
+const WEB_APP_URL = scriptProperties.getProperty("WEB_APP_URL") || "https://script.google.com/macros/s/AKfycbw218gf5IZqOzkoilIZBpISRFQ4o9aH6_B9pxPJuf70FORyuNFEV4y7csTCcC7rYYbE/exec"; // สำหรับปุ่มกดใน LINE
 
-// ─── API PROVIDERS CONFIGURATION ─────────────────────────────
-const API_PROVIDERS = [
-  { name: "GEMINI", provider: "google" },
-  { name: "OPENAI", provider: "openai" },
-  { name: "CLAUDE", provider: "anthropic" }
-];
+// Telegram Config
+const TELEGRAM_BOT_TOKEN = scriptProperties.getProperty("TELEGRAM_BOT_TOKEN") || "";
+const TELEGRAM_ADMIN_CHAT_ID = scriptProperties.getProperty("TELEGRAM_ADMIN_CHAT_ID") || "";
+
+// ─── OFFLINE RULE-BASED MATCHING ENGINE ────────────────────────
 
 /**
- * ฟังก์ชันหลักสำหรับเรียก AI พร้อมระบบ Fallback สลับ API อัตโนมัติ
+ * คลังเทมเพลตข้อมูลรายงาน HosXP แบบรวมศูนย์
+ */
+function getTemplates() {
+  return [
+    {
+      id: "opd_visit",
+      keywords: ["opd", "ผู้ป่วยนอก", "visit", "คนไข้นอก", "บริการ"],
+      name: "📋 รายงานสถิติผู้ป่วยนอก (OPD)",
+      objective: "รายงานสรุปจำนวนผู้มารับบริการผู้ป่วยนอก จำแนกตามแผนก สิทธิ์การรักษา และช่วงวันที่",
+      columns: ["ลำดับ", "HN", "ชื่อ-สกุล", "วันที่มารับบริการ", "แผนก", "สิทธิ์การรักษา", "การวินิจฉัยหลัก (ICD-10)"],
+      sql: "SELECT v.vn AS 'เลข VN', p.hn AS 'HN', CONCAT(p.fname, ' ', p.lname) AS 'ชื่อ-สกุล', v.vstdate AS 'วันที่', sp.name AS 'แผนก', pt.name AS 'สิทธิ์การรักษา', v.pdx AS 'การวินิจฉัยหลัก (ICD-10)' FROM vn_stat v LEFT JOIN patient p ON v.hn = p.hn LEFT JOIN spclty sp ON v.spclty = sp.spclty LEFT JOIN pttype pt ON v.pttype = pt.pttype WHERE v.vstdate BETWEEN :start_date AND :end_date ORDER BY v.vstdate, v.vn;",
+      criteria: "vstdate BETWEEN :start_date AND :end_date",
+      tables: "vn_stat, patient, spclty, pttype",
+      notes: [
+        "เปลี่ยน :start_date และ :end_date เป็นวันที่ต้องการ เช่น '2024-01-01'",
+        "หากต้องการกรองแผนก เพิ่ม AND v.spclty = '<รหัสแผนก>'",
+        "ตาราง vn_stat เหมาะสำหรับรายงานสถิติ เพราะมีดัชนีที่ดีกว่า ovst"
+      ]
+    },
+    {
+      id: "ipd_visit",
+      keywords: ["ipd", "ผู้ป่วยใน", "นอนโรงพยาบาล", "admit", "discharge", "จำหน่าย", "ward"],
+      name: "🛏️ รายงานสถิติผู้ป่วยใน (IPD)",
+      objective: "รายงานสรุปการนอนโรงพยาบาล จำแนกตามหอผู้ป่วย วันที่รับ/จำหน่าย และการวินิจฉัย",
+      columns: ["เลข AN", "HN", "ชื่อ-สกุล", "วันที่รับไว้", "วันที่จำหน่าย", "จำนวนวันนอน", "หอผู้ป่วย", "การวินิจฉัยหลัก"],
+      sql: "SELECT a.an AS 'เลข AN', p.hn AS 'HN', CONCAT(p.fname, ' ', p.lname) AS 'ชื่อ-สกุล', a.regdate AS 'วันที่รับไว้', a.dchdate AS 'วันที่จำหน่าย', DATEDIFF(a.dchdate, a.regdate) AS 'จำนวนวันนอน', w.name AS 'หอผู้ป่วย', a.pdx AS 'การวินิจฉัยหลัก (ICD-10)' FROM an_stat a LEFT JOIN patient p ON a.hn = p.hn LEFT JOIN ward w ON a.ward = w.ward WHERE a.regdate BETWEEN :start_date AND :end_date ORDER BY a.regdate, a.an;",
+      criteria: "regdate BETWEEN :start_date AND :end_date",
+      tables: "an_stat, patient, ward",
+      notes: [
+        "เปลี่ยน :start_date และ :end_date เป็นวันที่ต้องการ",
+        "หากต้องการกรอง ward ให้เพิ่ม AND a.ward = '<รหัส ward>'",
+        "dchdate อาจเป็น NULL หากยังไม่จำหน่าย"
+      ]
+    },
+    {
+      id: "drug_usage",
+      keywords: ["ยา", "drug", "เวชภัณฑ์", "รายการยา", "drugitems", "opitemrece", "ค่ายา", "จ่ายยา"],
+      name: "💊 รายงานการจ่ายยา/เวชภัณฑ์",
+      objective: "รายงานสรุปรายการยาและเวชภัณฑ์ที่จ่ายให้ผู้ป่วยในช่วงเวลาที่กำหนด",
+      columns: ["วันที่", "HN", "ชื่อ-สกุล", "รหัสยา", "ชื่อยา", "จำนวน", "หน่วย", "ราคารวม"],
+      sql: "SELECT r.rxdate AS 'วันที่จ่าย', p.hn AS 'HN', CONCAT(p.fname, ' ', p.lname) AS 'ชื่อ-สกุล', r.icode AS 'รหัสยา', d.name AS 'ชื่อยา', d.strength AS 'ความแรง', r.qty AS 'จำนวน', d.units AS 'หน่วย', r.sum_price AS 'ราคารวม (บาท)' FROM opitemrece r LEFT JOIN patient p ON r.hn = p.hn LEFT JOIN drugitems d ON r.icode = d.icode WHERE r.rxdate BETWEEN :start_date AND :end_date AND r.vn IS NOT NULL ORDER BY r.rxdate, r.hn;",
+      criteria: "rxdate BETWEEN :start_date AND :end_date และ vn/an ไม่ใช่ NULL",
+      tables: "opitemrece, patient, drugitems",
+      notes: [
+        "สำหรับ IPD เปลี่ยน vn IS NOT NULL เป็น an IS NOT NULL",
+        "หากต้องการเฉพาะยาบางตัว เพิ่ม AND r.icode IN (...)",
+        "ตาราง nondrugitems ใช้สำหรับค่าบริการที่ไม่ใช่ยา"
+      ]
+    },
+    {
+      id: "diagnosis",
+      keywords: ["โรค", "icd", "วินิจฉัย", "diagnosis", "diag", "โรคหลัก", "โรครอง", "icd10"],
+      name: "🩺 รายงานการวินิจฉัยโรค (ICD-10)",
+      objective: "รายงานสรุปจำนวนผู้ป่วยจำแนกตามรหัสโรค ICD-10 ทั้งการวินิจฉัยหลักและรอง",
+      columns: ["รหัสโรค (ICD-10)", "ชื่อโรค", "จำนวนผู้ป่วย OPD", "จำนวนครั้งที่พบ"],
+      sql: "SELECT od.icd10 AS 'รหัสโรค', i.name AS 'ชื่อโรค', COUNT(DISTINCT od.hn) AS 'จำนวนผู้ป่วย (คน)', COUNT(od.ovst_diag_id) AS 'จำนวนครั้งที่พบ' FROM ovstdiag od LEFT JOIN vn_stat vs ON od.vn = vs.vn LEFT JOIN icd101 i ON od.icd10 = i.code WHERE vs.vstdate BETWEEN :start_date AND :end_date AND od.diagtype = 1 GROUP BY od.icd10, i.name ORDER BY COUNT(od.ovst_diag_id) DESC LIMIT 20;",
+      criteria: "vstdate BETWEEN :start_date AND :end_date และ diagtype = 1 (โรคหลัก)",
+      tables: "ovstdiag, vn_stat, icd101",
+      notes: [
+        "เปลี่ยน diagtype = 1 เป็น IN (1,2,3,4) หากต้องการโรครองด้วย",
+        "สำหรับ IPD ใช้ตาราง iptdiag และ an_stat แทน"
+      ]
+    },
+    {
+      id: "revenue",
+      keywords: ["รายได้", "ค่ารักษา", "เงิน", "income", "revenue", "ค่าบริการ", "ค่าใช้จ่าย", "billing", "ใบเสร็จ"],
+      name: "💰 รายงานรายได้ค่ารักษาพยาบาล",
+      objective: "รายงานสรุปรายได้ค่ารักษาพยาบาลจำแนกตามประเภทผู้ป่วยและสิทธิ์การรักษา",
+      columns: ["วันที่", "สิทธิ์การรักษา", "จำนวนผู้ป่วย (คน)", "จำนวนครั้งบริการ", "รายได้รวม (บาท)"],
+      sql: "SELECT vs.vstdate AS 'วันที่', pt.name AS 'สิทธิ์การรักษา', COUNT(DISTINCT vs.hn) AS 'จำนวนผู้ป่วย (คน)', COUNT(vs.vn) AS 'จำนวนครั้งบริการ', SUM(vs.income) AS 'รายได้รวม (บาท)' FROM vn_stat vs LEFT JOIN pttype pt ON vs.pttype = pt.pttype WHERE vs.vstdate BETWEEN :start_date AND :end_date GROUP BY vs.vstdate, vs.pttype, pt.name ORDER BY vs.vstdate, SUM(vs.income) DESC;",
+      criteria: "vstdate BETWEEN :start_date AND :end_date",
+      tables: "vn_stat, pttype",
+      notes: [
+        "ฟิลด์ income ใน vn_stat คือยอดรวมรายได้ต่อการมารับบริการ 1 ครั้ง",
+        "ฟิลด์ uc_money คือส่วนที่ UC/บัตรทองรับผิดชอบ",
+        "หากต้องการรายละเอียดเพิ่ม ให้ JOIN ตาราง opitemrece"
+      ]
+    },
+    {
+      id: "patient_info",
+      keywords: ["ข้อมูลผู้ป่วย", "patient", "hn", "ประชากร", "ทะเบียน", "บัตรประชาชน", "cid", "ทะเบียนผู้ป่วย"],
+      name: "👤 รายงานทะเบียนผู้ป่วย",
+      objective: "รายงานข้อมูลพื้นฐานของผู้ป่วยที่ลงทะเบียนในระบบ",
+      columns: ["HN", "ชื่อ", "นามสกุล", "เพศ", "วันเกิด", "อายุ", "เลขบัตรประชาชน"],
+      sql: "SELECT p.hn AS 'HN', p.fname AS 'ชื่อ', p.lname AS 'นามสกุล', CASE p.sex WHEN '1' THEN 'ชาย' WHEN '2' THEN 'หญิง' ELSE 'ไม่ระบุ' END AS 'เพศ', p.birthday AS 'วันเกิด', TIMESTAMPDIFF(YEAR, p.birthday, CURDATE()) AS 'อายุ (ปี)', p.cid AS 'เลขบัตรประชาชน' FROM patient p WHERE p.hn IS NOT NULL ORDER BY p.hn;",
+      criteria: "hn IS NOT NULL",
+      tables: "patient",
+      notes: [
+        "ตาราง patient เป็นตารางหลักของผู้ป่วยทุกคนในระบบ",
+        "ฟิลด์ sex: 1=ชาย, 2=หญิง",
+        "birthday ใช้คำนวณอายุ"
+      ]
+    },
+    {
+      id: "lab",
+      keywords: ["lab", "แล็บ", "ผลการตรวจ", "ตรวจเลือด", "ห้องแล็บ", "laboratory", "ผลแล็บ"],
+      name: "🔬 รายงานผลการตรวจทางห้องปฏิบัติการ (Lab)",
+      objective: "รายงานสรุปรายการตรวจและผลการตรวจทางห้องปฏิบัติการ",
+      columns: ["วันที่", "HN", "ชื่อ-สกุล", "รายการตรวจ", "ผลการตรวจ", "หน่วย", "ค่าอ้างอิง"],
+      sql: "SELECT lr.lab_order_date AS 'วันที่สั่ง', p.hn AS 'HN', CONCAT(p.fname, ' ', p.lname) AS 'ชื่อ-สกุล', li.lab_items_name AS 'รายการตรวจ', lrs.lab_result AS 'ผลการตรวจ', li.lab_items_unit AS 'หน่วย', li.lab_items_normal_value AS 'ค่าอ้างอิง' FROM lab_order lr LEFT JOIN patient p ON lr.hn = p.hn LEFT JOIN lab_result_list lrs ON lr.lab_order_number = lrs.lab_order_number LEFT JOIN lab_items li ON lrs.lab_items_number = li.lab_items_number WHERE lr.lab_order_date BETWEEN :start_date AND :end_date ORDER BY lr.lab_order_date, p.hn;",
+      criteria: "lab_order_date BETWEEN :start_date AND :end_date",
+      tables: "lab_order, patient, lab_result_list, lab_items",
+      notes: [
+        "ชื่อตาราง Lab อาจแตกต่างกันตามเวอร์ชัน HosXP",
+        "ตรวจสอบโครงสร้างตารางแล็บของโรงพยาบาลก่อนใช้งาน"
+      ]
+    },
+    {
+      id: "appointment",
+      keywords: ["นัด", "appointment", "นัดหมาย", "follow up", "followup", "นัดตรวจ"],
+      name: "📅 รายงานการนัดหมาย",
+      objective: "รายงานสรุปรายการผู้ป่วยที่มีการนัดหมาย จำแนกตามวันนัดและแผนก",
+      columns: ["วันนัด", "HN", "ชื่อ-สกุล", "แผนกที่นัด", "หมายเหตุการนัด"],
+      sql: "SELECT a.appoint_date AS 'วันนัด', p.hn AS 'HN', CONCAT(p.fname, ' ', p.lname) AS 'ชื่อ-สกุล', sp.name AS 'แผนกที่นัด', a.note AS 'หมายเหตุ' FROM oapp a LEFT JOIN patient p ON a.hn = p.hn LEFT JOIN spclty sp ON a.spclty = sp.spclty WHERE a.appoint_date BETWEEN :start_date AND :end_date ORDER BY a.appoint_date, sp.name;",
+      criteria: "appoint_date BETWEEN :start_date AND :end_date",
+      tables: "oapp, patient, spclty",
+      notes: [
+        "ตาราง oapp คือตารางการนัดหมายผู้ป่วยนอก",
+        "note คือบันทึกเพิ่มเติมเกี่ยวกับการนัด"
+      ]
+    }
+  ];
+}
+
+/**
+ * ค้นหาและจับคู่รายงานสำเร็จรูปตามคำสำคัญ (Offline Rule Engine)
  */
 function getAIResponseWithFallback(prompt, systemInstruction, history = []) {
-  const props = PropertiesService.getScriptProperties().getProperties();
-  
-  for (const api of API_PROVIDERS) {
-    try {
-      const apiKey = props[api.name + "_API_KEY"];
-      if (!apiKey) continue; // ข้ามถ้าไม่มี Key
+  const query = prompt.toLowerCase();
+  const templates = getTemplates();
 
-      let response;
-      if (api.provider === "google") {
-        response = callGemini(prompt, systemInstruction, history, apiKey);
-      } else if (api.provider === "openai") {
-        response = callOpenAI(prompt, systemInstruction, history, apiKey);
-      } else if (api.provider === "anthropic") {
-        response = callAnthropic(prompt, systemInstruction, history, apiKey);
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (let i = 0; i < templates.length; i++) {
+    let score = 0;
+    const kw = templates[i].keywords;
+    for (let j = 0; j < kw.length; j++) {
+      if (query.indexOf(kw[j].toLowerCase()) !== -1) {
+        score++;
       }
-
-      const status = response.getResponseCode();
-      const content = response.getContentText();
-      const json = JSON.parse(content);
-
-      // ถ้าเจอ Error ที่ควรสลับ (429: Rate Limit, 401: Unauthorized, 403: Forbidden/Quota)
-      if ([401, 403, 429].includes(status)) {
-        writeLog("AI_FALLBACK", api.name, `Error ${status}: กำลังสลับไป API ถัดไป...`);
-        continue; 
-      }
-
-      if (status !== 200) {
-        writeLog("AI_ERROR", api.name, `HTTP ${status}: ${content}`);
-        continue;
-      }
-
-      // แกะคำตอบตามโครงสร้างแต่ละค่าย
-      let aiText = "";
-      if (api.provider === "google") aiText = json.candidates[0].content.parts[0].text;
-      else if (api.provider === "openai") aiText = json.choices[0].message.content;
-      else if (api.provider === "anthropic") aiText = json.content[0].text;
-
-      return { success: true, text: aiText, provider: api.name };
-
-    } catch (e) {
-      writeLog("AI_EXCEPTION", api.name, e.message);
-      continue;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = templates[i];
     }
   }
-  return { success: false, message: "API ทุกค่ายไม่สามารถใช้งานได้ในขณะนี้" };
-}
 
-// ─── PROVIDER SPECIFIC CALLS ──────────────────────────────────
+  // หากระบุ role เป็น admin หรือให้หา SQL
+  const isAdmin = systemInstruction.indexOf("IT") !== -1 || systemInstruction.indexOf("MySQL") !== -1;
 
-function callGemini(prompt, system, history, key) {
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent?key=${key}`;
-  const contents = history.map(h => ({ role: h.role === "model" ? "model" : "user", parts: [{ text: h.text }] }));
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  if (bestMatch) {
+    let aiText = "";
+    const columnsText = bestMatch.columns.map((c, i) => `${i+1}. ${c}`).join("\n");
+    const notesText = bestMatch.notes.map(n => `⚡ ${n}`).join("\n");
 
-  return UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    muteHttpExceptions: true,
-    payload: JSON.stringify({
-      contents: contents,
-      systemInstruction: { parts: [{ text: system }] },
-      generationConfig: { temperature: 0.3, maxOutputTokens: 2048 }
-    })
-  });
-}
+    if (isAdmin) {
+      aiText = "### " + bestMatch.name + "\n" +
+               "**1. วัตถุประสงค์ (Objective):**\n" + bestMatch.objective + "\n\n" +
+               "**2. ข้อมูลที่ต้องแสดงในรายงาน (Output Columns):**\n" + columnsText + "\n\n" +
+               "**3. เงื่อนไขและตัวกรอง (Filters & Criteria):**\n- " + bestMatch.criteria + "\n\n" +
+               "**4. ตารางหลักของ HosXP ที่เกี่ยวข้อง (Related Tables):**\n- " + bestMatch.tables + "\n\n" +
+               "**5. ร่างคำสั่ง SQL (Draft SQL Query):**\n```sql\n" + bestMatch.sql + "\n```\n\n" +
+               "**6. ข้อแนะนำและข้อจำกัดทางเทคนิค (Suggestions):**\n" + notesText;
+    } else {
+      const columnsBullet = bestMatch.columns.map(c => `• ${c}`).join("\n");
+      aiText = "สวัสดีครับ ผมเป็นระบบวิเคราะห์ความต้องการรายงานอัตโนมัติ 🏥\n" +
+               "จากการวิเคราะห์คำขอของคุณ ดูเหมือนว่าคุณต้องการ: **" + bestMatch.name + "**\n\n" +
+               "**รายละเอียดรายงาน:**\n" +
+               "- **วัตถุประสงค์:** " + bestMatch.objective + "\n" +
+               "- **คอลัมน์ที่แสดง:** \n" + columnsBullet + "\n\n" +
+               "**คำแนะนำในการส่งข้อมูล:**\n" +
+               "- กรุณาระบุช่วงวันที่ที่ต้องการให้ชัดเจน (เช่น 1 ม.ค. 67 ถึง 31 ม.ค. 67)\n" +
+               "- หากมีตัวกรองเฉพาะ เช่น เฉพาะสิทธิ์ บัตรทอง/ข้าราชการ หรือระบุเฉพาะแพทย์ สามารถพิมพ์แจ้งไว้ในคำขอเพิ่มเติมได้เลยครับ";
+    }
+    return { success: true, text: aiText, provider: "OFFLINE_RULE_ENGINE" };
+  }
 
-function callOpenAI(prompt, system, history, key) {
-  const url = "https://api.openai.com/v1/chat/completions";
-  const messages = [{ role: "system", content: system }];
-  history.forEach(h => messages.push({ role: h.role === "model" ? "assistant" : "user", content: h.text }));
-  messages.push({ role: "user", content: prompt });
+  // Fallback เมื่อไม่เจอหัวข้อที่ตรง
+  let fallbackText = "";
+  if (isAdmin) {
+    fallbackText = "### ❓ ไม่สามารถร่าง SQL ที่เหมาะสมได้อัตโนมัติ\n" +
+                   "เนื่องจากระบบ Offline Rule Engine ตรวจไม่พบคำสำคัญ (Keywords) ที่คุ้นเคยในคำขอของคุณ\n\n" +
+                   "**คำแนะนำเพิ่มเติม:**\n" +
+                   "1. กรุณาตรวจสอบตารางพื้นฐานของ HOSxP เช่น `patient`, `ovst`, `vn_stat`, `an_stat`, `opitemrece`\n" +
+                   "2. ตรวจสอบเงื่อนไขการเชื่อมต่อ (`JOIN`) และเขียน SQL ตามโครงสร้างความสัมพันธ์ของคุณเอง\n" +
+                   "3. หากพิมพ์สอบถามในแชท ลองใช้คำสั้นๆ เช่น: `OPD`, `IPD`, `ค่ายา`, `วินิจฉัยโรค`, `นัดหมาย`, `ผลแล็บ`";
+  } else {
+    fallbackText = "สวัสดีครับ! ขออภัยด้วยครับที่ระบบยังไม่พบรายงานที่ตรงกับคำอธิบายของคุณโดยตรง 🏥\n\n" +
+                   "**หัวข้อรายงานที่ระบบรองรับ:**\n" +
+                   "• **ผู้ป่วยนอก (OPD)**: สถิติผู้ป่วยนอก, แผนก, จำนวน visit\n" +
+                   "• **ผู้ป่วยใน (IPD)**: สถิติผู้ป่วยใน, หอผู้ป่วย (ward), วันนอน\n" +
+                   "• **ยาและเวชภัณฑ์**: รายงานการจ่ายยา, ค่ายา, ประวัติจ่ายยา\n" +
+                   "• **โรคและการวินิจฉัย**: รายงานสรุปโรค (ICD-10)\n" +
+                   "• **การเงินและรายได้**: สถิติรายได้ค่ารักษาพยาบาล แยกตามสิทธิ์\n" +
+                   "• **ทะเบียนผู้ป่วย**: ข้อมูลทั่วไป, HN, ค้นหาประวัติ\n" +
+                   "• **ผลแล็บ (Lab)**: รายการตรวจห้องแล็บและผลการตรวจ\n" +
+                   "• **นัดหมาย**: ตารางคิวนัดล่วงหน้า\n\n" +
+                   "คุณสามารถพิมพ์คำสั้นๆ เช่น *\"รายงาน OPD\"* หรือ *\"ขอยอดค่ายา\"* เพื่อให้ระบบแนะนำได้ทันทีครับ!";
+  }
 
-  return UrlFetchApp.fetch(url, {
-    method: "post",
-    headers: { "Authorization": `Bearer ${key}` },
-    contentType: "application/json",
-    muteHttpExceptions: true,
-    payload: JSON.stringify({
-      model: "gpt-3.5-turbo",
-      messages: messages,
-      temperature: 0.3
-    })
-  });
-}
-
-function callAnthropic(prompt, system, history, key) {
-  const url = "https://api.anthropic.com/v1/messages";
-  const messages = history.map(h => ({ role: h.role === "model" ? "assistant" : "user", content: h.text }));
-  messages.push({ role: "user", content: prompt });
-
-  return UrlFetchApp.fetch(url, {
-    method: "post",
-    headers: {
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    muteHttpExceptions: true,
-    payload: JSON.stringify({
-      model: "claude-3-haiku-20240307",
-      system: system,
-      messages: messages,
-      max_tokens: 2048
-    })
-  });
+  return { success: true, text: fallbackText, provider: "OFFLINE_RULE_ENGINE" };
 }
 
 /**
- * สุดยอดฟังก์ชันตรวจเช็ค AI (Super Debug)
- * ให้รันฟังก์ชันนี้เพื่อดูสาเหตุที่แท้จริงว่าทำไม AI ถึงไม่ทำงาน
+ * จำลองฟังก์ชันตรวจสอบระบบ AI
  */
 function superDebugAI() {
-  const props = PropertiesService.getScriptProperties().getProperties();
-  Logger.log("🚀 เริ่มการตรวจสอบระบบ AI...");
-
-  API_PROVIDERS.forEach(api => {
-    const keyName = api.name + "_API_KEY";
-    const key = props[keyName];
-    
-    if (!key) {
-      Logger.log(`❌ ${api.name}: ตรวจไม่พบ Key ชื่อ "${keyName}" ใน Script Properties (ระบบจึงข้ามไป)`);
-      return;
-    }
-
-    Logger.log(`⏳ ${api.name}: ตรวจพบ Key... กำลังลองยิงทดสอบ...`);
-    
-    try {
-      let res;
-      if (api.provider === "google") res = callGemini("Hi", "Test", [], key);
-      else if (api.provider === "openai") res = callOpenAI("Hi", "Test", [], key);
-      else if (api.provider === "anthropic") res = callAnthropic("Hi", "Test", [], key);
-      
-      const code = res.getResponseCode();
-      const body = res.getContentText();
-      
-      if (code === 200) {
-        Logger.log(`✅ ${api.name}: ทำงานได้ปกติ! (HTTP 200)`);
-      } else {
-        Logger.log(`⚠️ ${api.name}: เชื่อมต่อได้แต่ Error (HTTP ${code})`);
-        Logger.log(`   รายละเอียด: ${body}`);
-      }
-    } catch (e) {
-      Logger.log(`❌ ${api.name}: ระบบขัดข้องขณะเชื่อมต่อ - ${e.message}`);
-    }
-  });
-  
-  Logger.log("🏁 จบการตรวจสอบ");
+  Logger.log("🚀 Offline Rule Engine ทำงานอย่างถูกต้อง ไม่จำเป็นต้องเชื่อมต่อ API ภายนอก");
 }
 
 /**
- * ฟังก์ชันสำหรับตรวจสอบการตั้งค่า API Keys (ใช้ Debug เท่านั้น)
- * ให้คลิกเลือกฟังก์ชันนี้แล้วกด "เรียกทำงาน" ในหน้า GAS Editor
+ * จำลองการเช็คค่า API Keys
  */
 function checkApiSettings() {
-  const props = PropertiesService.getScriptProperties().getProperties();
-  const results = [];
-  
-  API_PROVIDERS.forEach(api => {
-    const keyName = api.name + "_API_KEY";
-    const keyExists = !!props[keyName];
-    results.push(`${keyName}: ${keyExists ? "✅ พร้อมใช้งาน" : "❌ ไม่พบ Key"}`);
-  });
-  
-  Logger.log("=== API Settings Diagnostic ===");
-  results.forEach(res => Logger.log(res));
-  Logger.log("===============================");
-  
-  return results.join("\n");
+  return "ระบบกำลังทำงานในโหมด Offline Rule Engine (ไม่ต้องใช้ API Key)";
 }
 
 // ─── ENTRY POINT (WEB APP) ───────────────────────────────────
 function doGet(e) {
+  // รองรับการรับส่งข้อมูลผ่าน API Web App สำหรับบอท
+  if (e && e.parameter && e.parameter.action) {
+    const apiToken = PropertiesService.getScriptProperties().getProperty("API_SECRET_TOKEN") || "";
+    const clientToken = e.parameter.token || "";
+
+    if (!apiToken || clientToken !== apiToken) {
+      return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Unauthorized: Invalid API Token" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    const action = e.parameter.action;
+    let result = { success: false, message: "Unknown action" };
+
+    if (action === "getTemplates") {
+      result = { success: true, templates: getTemplates() };
+    } else if (action === "getPendingRequests") {
+      // ดึงคำขอที่มีสถานะ "กำลังดำเนินการ" เพื่อไปรันดึงรายงานใน รพ. อัตโนมัติ
+      const sheet = getSheet(SHEET_NAME_REQUESTS);
+      const data = sheet.getDataRange().getValues();
+      const parseData = (val) => (val instanceof Date) ? val.toISOString() : val;
+      const pendingRows = [];
+
+      for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if ((row[10] || "").toString().trim() === "กำลังดำเนินการ") {
+          pendingRows.push({
+            id: parseData(row[0]),
+            requestNo: parseData(row[1]),
+            requesterName: parseData(row[2]),
+            reportType: parseData(row[5]),
+            dateFrom: parseData(row[6]),
+            dateTo: parseData(row[7]),
+            purpose: parseData(row[8]),
+            urgency: parseData(row[9]),
+            adminNote: parseData(row[11]), // มีคำสั่ง SQL ที่แอดมินอนุมัติแล้ว
+            dataType: parseData(row[16] || ""),
+            requestedFields: parseData(row[17] || ""),
+            filterCondition: parseData(row[18] || ""),
+            fileFormat: parseData(row[19] || "")
+          });
+        }
+      }
+      result = { success: true, requests: pendingRows };
+    } else if (action === "analyze") {
+      const query = e.parameter.query || "";
+      const role = e.parameter.role || "doctor";
+
+      const adminInstruction = `คุณคือ AI ผู้ช่วยอัจฉริยะสำหรับ IT ในการวิเคราะห์ตารางและเขียน SQL HOSxP (MySQL/MariaDB)
+ทุกครั้งที่ให้ SQL ต้องครอบด้วย markdown code block (\`\`\`sql ... \`\`\`) และอธิบายเหตุผลสั้นๆ`;
+      const userInstruction = "คุณคือ AI ผู้ช่วยอัจฉริยะสำหรับบุคลากรทางการแพทย์ในระบบขอรายงาน HosXP\n" +
+        "ห้ามแสดง SQL หรือชื่อตารางเชิงเทคนิคให้ผู้ใช้เห็นเด็ดขาด ให้แนะนำวิธีอธิบายรายงานที่ดีและแนะนำการกรอกแบบฟอร์มขอรายงานแทน";
+
+      const systemInstruction = role === "admin" ? adminInstruction : userInstruction;
+      result = getAIResponseWithFallback(query, systemInstruction);
+    }
+
+    return ContentService.createTextOutput(JSON.stringify(result))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
   return HtmlService
     .createTemplateFromFile("Index")
     .evaluate()
@@ -215,10 +320,130 @@ function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
-// ─── LINE WEBHOOK (ใช้สำหรับหา GROUP ID และ USER ID) ──────────
+// ─── LINE WEBHOOK & AUTOMATION POST ENDPOINT ──────────────────
 function doPost(e) {
   try {
-    const json = JSON.parse(e.postData.contents);
+    const rawBody = e.postData.contents;
+    const json = JSON.parse(rawBody);
+
+    // 1. ตรวจสอบหากเป็น Custom API Request จาก Python Script
+    if (json && json.action) {
+      const apiToken = PropertiesService.getScriptProperties().getProperty("API_SECRET_TOKEN") || "";
+      const clientToken = json.token || "";
+      if (!apiToken || clientToken !== apiToken) {
+        return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Unauthorized: Invalid API Token" }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      if (json.action === "updateRequestWithReport") {
+        ensureHeaders();
+        const requestId = json.requestId;
+        const base64Data = json.fileData;
+        const fileName = json.fileName;
+        const mimeType = json.mimeType;
+
+        const uploadResult = uploadFileToDrive_(base64Data, fileName, mimeType, requestId);
+        if (!uploadResult.success) {
+          return ContentService.createTextOutput(JSON.stringify({ success: false, message: uploadResult.message }))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+
+        const sheet = getSheet(SHEET_NAME_REQUESTS);
+        const data = sheet.getDataRange().getValues();
+        let updated = false;
+
+        for (let i = 1; i < data.length; i++) {
+          if (data[i][0] === requestId) {
+            const previousStatus = data[i][10];
+            sheet.getRange(i + 1, 11).setValue("เสร็จสิ้น"); // status (column 11)
+            sheet.getRange(i + 1, 14).setValue(new Date()); // updatedAt (column 14)
+            sheet.getRange(i + 1, 23).setValue(uploadResult.url); // downloadUrl (column 23)
+            writeRequestHistory(requestId, data[i][1], "SYSTEM", "REPORT_UPLOADED", previousStatus, "เสร็จสิ้น", "อัปโหลดไฟล์รายงานอัตโนมัติ");
+            updated = true;
+            break;
+          }
+        }
+
+        if (updated) {
+          writeLog("SYSTEM", "API_REPORT_UPLOAD", `อัปเดตไฟล์รายงานสำเร็จสำหรับคำขอ ID: ${requestId}`);
+          return ContentService.createTextOutput(JSON.stringify({ success: true, url: uploadResult.url }))
+            .setMimeType(ContentService.MimeType.JSON);
+        } else {
+          return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Request ID not found" }))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
+      if (json.action === "reportRequestError") {
+        ensureHeaders();
+        const requestId = json.requestId;
+        const errorMsg = json.errorMessage;
+
+        const sheet = getSheet(SHEET_NAME_REQUESTS);
+        const data = sheet.getDataRange().getValues();
+        let updated = false;
+
+        for (let i = 1; i < data.length; i++) {
+          if (data[i][0] === requestId) {
+            const previousStatus = data[i][10];
+            sheet.getRange(i + 1, 11).setValue("ปฏิเสธ"); // status (column 11)
+            sheet.getRange(i + 1, 12).setValue(`⚠️ ข้อผิดพลาดฐานข้อมูล SQL:\n${errorMsg}`); // adminNote (column 12)
+            sheet.getRange(i + 1, 14).setValue(new Date()); // updatedAt (column 14)
+            writeRequestHistory(requestId, data[i][1], "SYSTEM", "REPORT_ERROR", previousStatus, "ปฏิเสธ", `รัน SQL ล้มเหลว: ${errorMsg}`);
+            updated = true;
+            break;
+          }
+        }
+
+        if (updated) {
+          writeLog("SYSTEM", "API_REPORT_ERROR", `บันทึกข้อผิดพลาดสำหรับคำขอ ID: ${requestId}`);
+          
+          // ส่งไลน์แจ้งเตือนกลุ่มแอดมินเกี่ยวกับการรัน SQL พัง
+          const alertMsg = `❌ <b>คำขอรันรายงานล้มเหลว</b>\n\n<b>ID:</b> ${requestId}\n<b>Error:</b> ${errorMsg}`;
+          if (TELEGRAM_ADMIN_CHAT_ID) {
+            sendTelegramNotification(TELEGRAM_ADMIN_CHAT_ID, alertMsg);
+          }
+          
+          return ContentService.createTextOutput(JSON.stringify({ success: true }))
+            .setMimeType(ContentService.MimeType.JSON);
+        } else {
+          return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Request ID not found" }))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+
+      return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Unknown action" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 2. ตรวจสอบลายเซ็น LINE Webhook (Signature Verification)
+    const lineChannelSecret = PropertiesService.getScriptProperties().getProperty("LINE_CHANNEL_SECRET") || "";
+    if (lineChannelSecret) {
+      // ตรวจสอบความถูกต้องของ X-Line-Signature ใน Header
+      const signature = e.headers && (e.headers['X-Line-Signature'] || e.headers['x-line-signature']);
+      if (!signature) {
+        writeLog("SECURITY_WARNING", "LINE_WEBHOOK_BLOCKED", "ตรวจไม่พบลายเซ็น X-Line-Signature");
+        return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Signature missing" }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      const computedSignature = Utilities.base64Encode(
+        Utilities.computeHmacSignature(
+          Utilities.MacAlgorithm.HMAC_SHA_256,
+          rawBody,
+          lineChannelSecret,
+          Utilities.Charset.UTF_8
+        )
+      );
+
+      if (signature !== computedSignature) {
+        writeLog("SECURITY_WARNING", "LINE_WEBHOOK_BLOCKED", "ลายเซ็น X-Line-Signature ไม่ถูกต้อง");
+        return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Invalid signature" }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // 3. ประมวลผล LINE Webhook ตามปกติ
     const event = json.events[0];
     if (!event) return;
 
@@ -270,7 +495,9 @@ function doPost(e) {
 /**
  * ดึงรายชื่อผู้ใช้ทั้งหมด (เฉพาะ Admin)
  */
-function getUsers() {
+function getUsers(sessionToken) {
+  const session = requireSession(sessionToken, "", true);
+  if (!session.ok) return { success: false, message: session.message };
   const sheet = getSheet(SHEET_NAME_USERS);
   const data = sheet.getDataRange().getValues();
   const headers = data[0];
@@ -284,6 +511,9 @@ function getUsers() {
         if (h === 'username' && val !== null && val !== undefined) {
           val = val.toString().trim();
         }
+        if (h === 'password') {
+          val = "_LEAVE_UNCHANGED_"; // Mask the password to client
+        }
         obj[h] = val;
       });
       return obj;
@@ -294,7 +524,9 @@ function getUsers() {
 /**
  * เพิ่มหรือแก้ไขผู้ใช้
  */
-function saveUser(payload) {
+function saveUser(payload, sessionToken) {
+  const session = requireSession(sessionToken, "", true);
+  if (!session.ok) return { success: false, message: session.message };
   const sheet = getSheet(SHEET_NAME_USERS);
   const data = sheet.getDataRange().getValues();
 
@@ -310,9 +542,22 @@ function saveUser(payload) {
     }
   }
 
+  let finalPassword = payload.password;
+  if (rowIndex > 0) {
+    const existingPasswordInSheet = data[rowIndex - 1][1]; // Column B
+    if (payload.password === "_LEAVE_UNCHANGED_") {
+      finalPassword = existingPasswordInSheet; // keep old hashed/plain password
+    } else {
+      finalPassword = hashPassword(payload.password); // hash new password
+    }
+  } else {
+    // New user
+    finalPassword = hashPassword(payload.password);
+  }
+
   const rowData = [
     newUsername,
-    payload.password,
+    finalPassword,
     payload.displayName,
     payload.email,
     payload.role,
@@ -338,11 +583,10 @@ function saveUser(payload) {
 /**
  * ลบผู้ใช้งานออกจากระบบ (เฉพาะ Admin)
  */
-function deleteUser(usernameToDelete, currentUsername, currentRole) {
+function deleteUser(usernameToDelete, currentUsername, currentRole, sessionToken) {
   try {
-    if (currentRole !== ADMIN_ROLE) {
-      return { success: false, message: "เฉพาะผู้ดูแลระบบเท่านั้นที่มีสิทธิ์ลบผู้ใช้" };
-    }
+    const session = requireSession(sessionToken, currentUsername, true);
+    if (!session.ok) return { success: false, message: session.message };
     if (usernameToDelete.toString().trim() === currentUsername.toString().trim()) {
       return { success: false, message: "ระบบป้องกันความปลอดภัย: ไม่สามารถลบ Account ของตัวเองได้" };
     }
@@ -411,14 +655,14 @@ function ensureHeaders() {
     "reportType", "dateFrom", "dateTo", "purpose", "urgency",
     "status", "adminNote", "createdAt", "updatedAt", "createdBy",
     "requesterPhone", "dataType", "requestedFields", "filterCondition",
-    "fileFormat", "neededDate", "additionalNote"
+    "fileFormat", "neededDate", "additionalNote", "downloadUrl"
   ];
 
   if (reqSheet.getLastRow() === 0) {
     reqSheet.appendRow(expectedReqHeaders);
     reqSheet.getRange(1, 1, 1, expectedReqHeaders.length).setFontWeight("bold").setBackground("#1a73e8").setFontColor("#ffffff");
   } else {
-    // อัปเดตโครงสร้างคอลัมน์เดิมหากมีไม่ครบ 22 ฟิลด์
+    // อัปเดตโครงสร้างคอลัมน์เดิมหากมีไม่ครบ 23 ฟิลด์
     const currentHeaders = reqSheet.getRange(1, 1, 1, reqSheet.getLastColumn()).getValues()[0];
     if (currentHeaders.length < expectedReqHeaders.length) {
       reqSheet.getRange(1, currentHeaders.length + 1, 1, expectedReqHeaders.length - currentHeaders.length)
@@ -434,10 +678,10 @@ function ensureHeaders() {
     usrSheet.getRange(1, 1, 1, expectedUsrHeaders.length).setFontWeight("bold").setBackground("#1a73e8").setFontColor("#ffffff");
 
     const seedData = [
-      ["admin", "admin1234", "ผู้ดูแลระบบ", "admin@hospital.go.th", "admin", "IT", "", ""],
-      ["doctor01", "doc1234", "นพ.สมชาย ใจดี", "doctor01@hospital.go.th", "doctor", "อายุรกรรม", "", ""],
-      ["doctor02", "doc1234", "พญ.สมหญิง รักษาดี", "doctor02@hospital.go.th", "doctor", "ศัลยกรรม", "", ""],
-      ["nurse01", "nur1234", "พยาบาล สมใจ", "nurse01@hospital.go.th", "doctor", "ห้องฉุกเฉิน", "", ""]
+      ["admin", hashPassword("admin1234"), "ผู้ดูแลระบบ", "admin@hospital.go.th", "admin", "IT", "", ""],
+      ["doctor01", hashPassword("doc1234"), "นพ.สมชาย ใจดี", "doctor01@hospital.go.th", "doctor", "อายุรกรรม", "", ""],
+      ["doctor02", hashPassword("doc1234"), "พญ.สมหญิง รักษาดี", "doctor02@hospital.go.th", "doctor", "ศัลยกรรม", "", ""],
+      ["nurse01", hashPassword("nur1234"), "พยาบาล สมใจ", "nurse01@hospital.go.th", "doctor", "ห้องฉุกเฉิน", "", ""]
     ];
     usrSheet.getRange(2, 1, seedData.length, expectedUsrHeaders.length).setValues(seedData);
   } else {
@@ -454,31 +698,105 @@ function ensureHeaders() {
     logSheet.appendRow(["timestamp", "username", "action", "detail"]);
     logSheet.getRange(1, 1, 1, 4).setFontWeight("bold").setBackground("#1a73e8").setFontColor("#ffffff");
   }
+
+  const historySheet = getSheet(SHEET_NAME_HISTORY);
+  if (historySheet.getLastRow() === 0) {
+    historySheet.appendRow(["timestamp", "requestId", "requestNo", "actor", "event", "fromStatus", "toStatus", "detail"]);
+    historySheet.getRange(1, 1, 1, 8).setFontWeight("bold").setBackground("#1a73e8").setFontColor("#ffffff");
+  }
+}
+
+function validateRequestPayload(payload) {
+  const required = ["requesterName", "requesterEmail", "department", "reportType", "dateFrom", "dateTo", "purpose", "urgency"];
+  for (let i = 0; i < required.length; i++) {
+    if (!payload || !String(payload[required[i]] || "").trim()) return `กรุณากรอกข้อมูล ${required[i]} ให้ครบถ้วน`;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(payload.requesterEmail).trim())) return "รูปแบบอีเมลไม่ถูกต้อง";
+  if (new Date(payload.dateFrom) > new Date(payload.dateTo)) return "วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด";
+  if (["ปกติ", "สูง", "ด่วนที่สุด"].indexOf(String(payload.urgency)) === -1) return "ระดับความเร่งด่วนไม่ถูกต้อง";
+  if (String(payload.reportType).length > 250 || String(payload.purpose).length > 3000) return "รายละเอียดคำขอยาวเกินกำหนด";
+  return "";
+}
+
+function writeRequestHistory(requestId, requestNo, actor, event, fromStatus, toStatus, detail) {
+  try {
+    const sheet = getSheet(SHEET_NAME_HISTORY);
+    sheet.appendRow([new Date().toISOString(), requestId, requestNo, actor, event, fromStatus || "", toStatus || "", detail || ""]);
+  } catch (_) {}
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────
+function hashPassword(password) {
+  if (!password) return "";
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, password, Utilities.Charset.UTF_8);
+  let hash = "";
+  for (let i = 0; i < digest.length; i++) {
+    let byteVal = digest[i];
+    if (byteVal < 0) byteVal += 256;
+    let byteString = byteVal.toString(16);
+    if (byteString.length == 1) byteString = "0" + byteString;
+    hash += byteString;
+  }
+  return hash;
+}
+
+function createSession(user) {
+  const token = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, "");
+  CacheService.getScriptCache().put("session:" + token, JSON.stringify(user), SESSION_TTL_SECONDS);
+  return token;
+}
+
+function requireSession(token, username, adminOnly) {
+  if (!token) return { ok: false, message: "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่" };
+  const raw = CacheService.getScriptCache().get("session:" + token);
+  if (!raw) return { ok: false, message: "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่" };
+  const user = JSON.parse(raw);
+  if (username && String(user.username) !== String(username)) return { ok: false, message: "เซสชันผู้ใช้ไม่ถูกต้อง" };
+  if (adminOnly && user.role !== ADMIN_ROLE) return { ok: false, message: "ไม่มีสิทธิ์ดำเนินการ" };
+  return { ok: true, user: user };
+}
+
 function login(username, password) {
   try {
     ensureHeaders();
     const sheet = getSheet(SHEET_NAME_USERS);
     const data = sheet.getDataRange().getValues();
+    const inputPasswordHash = hashPassword(password);
 
     for (let i = 1; i < data.length; i++) {
       const row = data[i];
-      if (row[0] && row[0].toString().trim() === username.toString().trim() && row[1].toString().trim() === password.toString().trim()) {
-        writeLog(username, "LOGIN", "เข้าสู่ระบบสำเร็จ");
-        return {
-          success: true,
-          user: {
-            username: row[0].toString().trim(),
-            displayName: row[2],
-            email: row[3],
-            role: row[4],
-            department: row[5],
-            lineId: row[6] || "",
-            telegramId: row[7] || ""
+      if (row[0] && row[0].toString().trim() === username.toString().trim()) {
+        const storedPassword = row[1] ? row[1].toString().trim() : "";
+        let passwordMatch = false;
+
+        // Check if storedPassword is already a SHA-256 hash (64 hex characters)
+        const isHashed = storedPassword.length === 64 && /^[0-9a-fA-F]+$/.test(storedPassword);
+
+        if (isHashed) {
+          passwordMatch = (storedPassword.toLowerCase() === inputPasswordHash.toLowerCase());
+        } else {
+          // Plain text comparison (migration path)
+          passwordMatch = (storedPassword === password.toString().trim());
+          if (passwordMatch) {
+            // Upgrade plain text password in sheet to hashed password
+            sheet.getRange(i + 1, 2).setValue(inputPasswordHash);
+            writeLog(username, "SECURITY_UPGRADE", "อัปเกรดรหัสผ่านเป็นแบบแฮช SHA-256 สำเร็จ");
           }
-        };
+        }
+
+        if (passwordMatch) {
+          writeLog(username, "LOGIN", "เข้าสู่ระบบสำเร็จ");
+          const user = {
+            username: row[0].toString().trim(),
+            displayName: row[2], email: row[3], role: row[4], department: row[5],
+            lineId: row[6] || "", telegramId: row[7] || ""
+          };
+          return {
+            success: true,
+            user: user,
+            sessionToken: createSession(user)
+          };
+        }
       }
     }
     return { success: false, message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" };
@@ -489,15 +807,19 @@ function login(username, password) {
 
 // ─── REQUESTS CRUD ───────────────────────────────────────────
 
-function getRequests(username, role, displayName) {
+function getRequests(username, role, displayName, sessionToken) {
   try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
+    role = session.user.role;
+    displayName = session.user.displayName;
     ensureHeaders();
     const sheet = getSheet(SHEET_NAME_REQUESTS);
     const data = sheet.getDataRange().getValues();
 
     const parseData = (val) => (val instanceof Date) ? val.toISOString() : val;
 
-    const rows = data.slice(1).map(row => ({
+    let rows = data.slice(1).map(row => ({
       id: parseData(row[0]),
       requestNo: parseData(row[1]),
       requesterName: parseData(row[2]),
@@ -519,18 +841,33 @@ function getRequests(username, role, displayName) {
       filterCondition: parseData(row[18] || ""),
       fileFormat: parseData(row[19] || ""),
       neededDate: parseData(row[20] || ""),
-      additionalNote: parseData(row[21] || "")
+      additionalNote: parseData(row[21] || ""),
+      downloadUrl: parseData(row[22] || "")
     }));
 
-    return { success: true, data: rows };
+    // ผู้ใช้ทั่วไปเห็นเฉพาะคำขอของตนเอง; ผู้ดูแลระบบเท่านั้นที่เห็นทุกคำขอ
+    if (role !== ADMIN_ROLE) {
+      const owner = String(displayName || "").trim();
+      const loginName = String(username || "").trim();
+      rows = rows.filter(r => r.createdBy === owner || r.createdBy === loginName);
+    }
+
+    return { success: true, data: rows.reverse() };
   } catch (e) {
     return { success: false, message: e.message };
   }
 }
 
-function createRequest(payload, username) {
+function createRequest(payload, username, sessionToken) {
+  let lock;
   try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
     ensureHeaders();
+    const validationError = validateRequestPayload(payload);
+    if (validationError) return { success: false, message: validationError };
+    lock = LockService.getScriptLock();
+    lock.waitLock(5000);
     const userSheet = getSheet(SHEET_NAME_USERS);
     const userData = userSheet.getDataRange().getValues();
 
@@ -569,10 +906,12 @@ function createRequest(payload, username) {
       payload.filterCondition || "",
       payload.fileFormat || "",
       payload.neededDate || "",
-      payload.additionalNote || ""
+      payload.additionalNote || "",
+      ""
     ]);
 
     writeLog(username, "CREATE", "สร้างคำขอโดย " + displayName);
+    writeRequestHistory(id, reqNo, username, "CREATE", "", "รอดำเนินการ", "สร้างคำขอใหม่");
 
     // 🚀 ยิงแจ้งเตือนเข้า LINE OA ทันทีที่มีการสร้างคำขอใหม่
     payload.requestNo = reqNo;
@@ -594,11 +933,38 @@ function createRequest(payload, username) {
     return { success: true, id: id, requestNo: reqNo };
   } catch (e) {
     return { success: false, message: e.message };
+  } finally {
+    if (lock && lock.hasLock()) lock.releaseLock();
   }
 }
 
-function updateRequest(id, payload, username, role) {
+function getRequestHistory(requestId, username, role, displayName, sessionToken) {
   try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
+    role = session.user.role;
+    displayName = session.user.displayName;
+    ensureHeaders();
+    const requestRows = getSheet(SHEET_NAME_REQUESTS).getDataRange().getValues();
+    const request = requestRows.slice(1).find(row => String(row[0]) === String(requestId));
+    if (!request) return { success: false, message: "ไม่พบรายการ" };
+    if (role !== ADMIN_ROLE && String(request[14] || "").trim() !== String(displayName || username || "").trim() && String(request[14] || "").trim() !== String(username || "").trim()) {
+      return { success: false, message: "ไม่มีสิทธิ์ดูประวัติรายการนี้" };
+    }
+    const rows = getSheet(SHEET_NAME_HISTORY).getDataRange().getValues().slice(1)
+      .filter(row => String(row[1]) === String(requestId))
+      .map(row => ({ timestamp: row[0] instanceof Date ? row[0].toISOString() : row[0], actor: row[3], event: row[4], fromStatus: row[5], toStatus: row[6], detail: row[7] }));
+    return { success: true, data: rows.reverse() };
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+function updateRequest(id, payload, username, role, sessionToken) {
+  try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
+    role = session.user.role;
     ensureHeaders();
     const sheet = getSheet(SHEET_NAME_REQUESTS);
     const data = sheet.getDataRange().getValues();
@@ -618,6 +984,13 @@ function updateRequest(id, payload, username, role) {
         const oldStatus = data[i][10];
         const createdBy = data[i][14];
 
+        if (role === ADMIN_ROLE && payload.status && ["รอดำเนินการ", "กำลังดำเนินการ", "เสร็จสิ้น", "ปฏิเสธ"].indexOf(payload.status) === -1) {
+          return { success: false, message: "สถานะคำขอไม่ถูกต้อง" };
+        }
+        if (payload.dateFrom && payload.dateTo && new Date(payload.dateFrom) > new Date(payload.dateTo)) {
+          return { success: false, message: "วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด" };
+        }
+
         sheet.getRange(row, 3).setValue(payload.requesterName || data[i][2]);
         sheet.getRange(row, 4).setValue(payload.requesterEmail || data[i][3]);
         sheet.getRange(row, 5).setValue(payload.department || data[i][4]);
@@ -630,6 +1003,7 @@ function updateRequest(id, payload, username, role) {
         if (role === ADMIN_ROLE) {
           sheet.getRange(row, 11).setValue(payload.status || data[i][10]);
           sheet.getRange(row, 12).setValue(payload.adminNote !== undefined ? payload.adminNote : data[i][11]);
+          sheet.getRange(row, 23).setValue(payload.downloadUrl !== undefined ? payload.downloadUrl : (data[i][22] || ""));
         }
 
         sheet.getRange(row, 14).setValue(new Date().toISOString());
@@ -644,6 +1018,11 @@ function updateRequest(id, payload, username, role) {
         sheet.getRange(row, 22).setValue(payload.additionalNote !== undefined ? payload.additionalNote : (data[i][21] || ""));
 
         writeLog(username, "UPDATE", "แก้ไขคำขอ " + data[i][1]);
+        if (role === ADMIN_ROLE && payload.status && payload.status !== oldStatus) {
+          writeRequestHistory(data[i][0], data[i][1], username, "STATUS_CHANGE", oldStatus, payload.status, payload.adminNote || "");
+        } else {
+          writeRequestHistory(data[i][0], data[i][1], username, "UPDATE", oldStatus, oldStatus, "แก้ไขรายละเอียดคำขอ");
+        }
 
         // 🚀 แจ้งเตือนกลุ่ม Admin กรณีผู้ใช้งานอัปเดตข้อมูลคำขอด้วยตนเอง
         if (role !== ADMIN_ROLE) {
@@ -708,8 +1087,11 @@ function updateRequest(id, payload, username, role) {
 }
 
 // ปรับปรุงระบบลบคำขอ: อนุญาตให้เจ้าของงานลบได้ ถ้างานยังไม่ถูกดำเนินงาน
-function deleteRequest(id, username, role) {
+function deleteRequest(id, username, role, sessionToken) {
   try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
+    role = session.user.role;
     const sheet = getSheet(SHEET_NAME_REQUESTS);
     const data = sheet.getDataRange().getValues();
 
@@ -752,8 +1134,10 @@ function deleteRequest(id, username, role) {
 }
 
 // ─── EMAIL ────────────────────────────────────────────────────
-function sendReportEmail(payload, username) {
+function sendReportEmail(payload, username, sessionToken) {
   try {
+    const session = requireSession(sessionToken, username, true);
+    if (!session.ok) return { success: false, message: session.message };
     const subject = `[HosXP Report] ${payload.requestNo} — ${payload.reportType}`;
     const body = buildEmailBody(payload);
 
@@ -935,11 +1319,30 @@ function buildNewRequestFlex(p) {
 }
 
 // 2. Flex Message สำหรับอัปเดตสถานะงาน
-function buildStatusUpdateFlex(requestNo, reportType, status, adminNote) {
+function buildStatusUpdateFlex(requestNo, reportType, status, adminNote, downloadUrl) {
   let statusColor = "#F3B34C"; // รอดำเนินการ (ส้ม)
   if (status === "กำลังดำเนินการ") statusColor = "#1A73E8"; // ฟ้า
   if (status === "เสร็จสิ้น") statusColor = "#2FB67E"; // เขียว
   if (status === "ปฏิเสธ") statusColor = "#DE5D4E"; // แดง
+
+  const footerContents = [
+    {
+      "type": "button",
+      "action": { "type": "uri", "label": "ตรวจสอบข้อมูลในระบบ", "uri": WEB_APP_URL },
+      "style": "secondary"
+    }
+  ];
+
+  // ถ้างานเสร็จสิ้นและมีลิงก์แนบ ให้เพิ่มปุ่มดาวน์โหลด
+  if (status === "เสร็จสิ้น" && downloadUrl) {
+    footerContents.push({
+      "type": "button",
+      "action": { "type": "uri", "label": "💾 ดาวน์โหลดไฟล์รายงาน", "uri": downloadUrl },
+      "style": "primary",
+      "color": "#10b981",
+      "margin": "sm"
+    });
+  }
 
   return {
     "type": "bubble",
@@ -974,20 +1377,18 @@ function buildStatusUpdateFlex(requestNo, reportType, status, adminNote) {
     },
     "footer": {
       "type": "box", "layout": "vertical",
-      "contents": [
-        {
-          "type": "button",
-          "action": { "type": "uri", "label": "ตรวจสอบข้อมูลในระบบ", "uri": WEB_APP_URL },
-          "style": "secondary"
-        }
-      ]
+      "contents": footerContents
     }
   };
 }
 
 // ─── DASHBOARD STATS ─────────────────────────────────────────
-function getDashboardStats(username, role, displayName) {
+function getDashboardStats(username, role, displayName, sessionToken) {
   try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
+    role = session.user.role;
+    displayName = session.user.displayName;
     ensureHeaders();
     const sheet = getSheet(SHEET_NAME_REQUESTS);
     const data = sheet.getDataRange().getValues();
@@ -998,15 +1399,39 @@ function getDashboardStats(username, role, displayName) {
       id: parseData(row[0]),
       requestNo: parseData(row[1]),
       requesterName: parseData(row[2]),
+      department: (row[4] || "").toString().trim(),
       reportType: parseData(row[5]),
+      urgency: (row[9] || "").toString().trim(),
       status: (row[10] || "").toString().trim(),
       createdAt: parseData(row[12]),
-      createdBy: (row[14] || "").toString().trim()
+      createdBy: (row[14] || "").toString().trim(),
+      downloadUrl: (row[22] || "").toString().trim()
     }));
 
     if (role !== ADMIN_ROLE) {
       rows = rows.filter(r => r.createdBy === displayName || r.createdBy === username);
     }
+
+    // Aggregates for Charts
+    const deptStats = {};
+    const urgencyStats = { "ปกติ": 0, "สูง": 0, "ด่วนที่สุด": 0 };
+
+    rows.forEach(r => {
+      const dept = r.department || "ไม่ระบุ";
+      deptStats[dept] = (deptStats[dept] || 0) + 1;
+
+      const urg = r.urgency || "ปกติ";
+      if (urgencyStats[urg] !== undefined) {
+        urgencyStats[urg]++;
+      } else {
+        urgencyStats[urg] = (urgencyStats[urg] || 0) + 1;
+      }
+    });
+
+    const topDepts = Object.keys(deptStats)
+      .map(name => ({ name, count: deptStats[name] }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
 
     const stats = {
       total: rows.length,
@@ -1014,7 +1439,10 @@ function getDashboardStats(username, role, displayName) {
       processing: rows.filter(r => r.status === "กำลังดำเนินการ").length,
       completed: rows.filter(r => r.status === "เสร็จสิ้น").length,
       rejected: rows.filter(r => r.status === "ปฏิเสธ").length,
-      recent: rows.slice(-10).reverse() // ดึงมา 10 รายการเพื่อให้สามารถกรองในหน้าแดชบอร์ดได้ยืดหยุ่นขึ้น
+      inboxCount: rows.filter(r => r.status === "เสร็จสิ้น" && r.downloadUrl).length,
+      recent: rows.slice(-10).reverse(), // ดึงมา 10 รายการเพื่อให้สามารถกรองในหน้าแดชบอร์ดได้ยืดหยุ่นขึ้น
+      depts: topDepts,
+      urgency: urgencyStats
     };
     return { success: true, data: stats };
   } catch (e) {
@@ -1041,8 +1469,10 @@ function writeLog(username, action, detail) {
   } catch (_) { }
 }
 
-function getMonthlyReport(month, year) {
+function getMonthlyReport(month, year, sessionToken) {
   try {
+    const session = requireSession(sessionToken, "", true);
+    if (!session.ok) return { success: false, message: session.message };
     ensureHeaders();
     const sheet = getSheet(SHEET_NAME_REQUESTS);
     const data = sheet.getDataRange().getValues();
@@ -1068,8 +1498,10 @@ function getMonthlyReport(month, year) {
 }
 
 // ─── PROFILE MANAGEMENT API ───────────────────────────────────
-function updateProfile(username, payload) {
+function updateProfile(username, payload, sessionToken) {
   try {
+    const session = requireSession(sessionToken, username);
+    if (!session.ok) return { success: false, message: session.message };
     const sheet = getSheet(SHEET_NAME_USERS);
     const data = sheet.getDataRange().getValues();
 
@@ -1078,7 +1510,9 @@ function updateProfile(username, payload) {
         const row = i + 1;
 
         // อัปเดตข้อมูลทีละฟิลด์ตามที่มีส่งมา
-        if (payload.password) sheet.getRange(row, 2).setValue(payload.password);
+        if (payload.password && payload.password.trim() !== "" && payload.password !== "_LEAVE_UNCHANGED_") {
+          sheet.getRange(row, 2).setValue(hashPassword(payload.password.trim()));
+        }
         if (payload.displayName) sheet.getRange(row, 3).setValue(payload.displayName);
         if (payload.email) sheet.getRange(row, 4).setValue(payload.email);
         if (payload.department) sheet.getRange(row, 6).setValue(payload.department);
@@ -1096,12 +1530,87 @@ function updateProfile(username, payload) {
   }
 }
 
-// ─── GEMINI AI REQUEST ANALYZER ──────────────────────────────
+// ─── GEMINI AI INTEGRATION ────────────────────────────────────
+
+/**
+ * เรียกใช้งาน Gemini 1.5 Flash API ผ่าน Google AI Studio
+ */
+function callGeminiAPI(prompt, systemInstruction, history = []) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey || apiKey.trim() === "" || apiKey.startsWith("ใส่")) {
+    Logger.log("Gemini API Key is not set or invalid. Using offline fallback.");
+    return null;
+  }
+
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + apiKey;
+
+  // จัดรูปแบบประวัติการแชท (Gemini API format)
+  let contents = [];
+  if (history && history.length > 0) {
+    history.forEach(msg => {
+      let role = msg.role;
+      // ปรับจูน Role ให้ถูกต้องตามข้อกำหนดของ Gemini API (ต้องมีแค่ user หรือ model)
+      if (role === "admin" || role === "doctor" || role === "user") {
+        role = "user";
+      }
+      contents.push({
+        role: role,
+        parts: [{ text: msg.text }]
+      });
+    });
+  }
+
+  // แทรกล่าสุดของผู้ส่ง
+  contents.push({
+    role: "user",
+    parts: [{ text: prompt }]
+  });
+
+  const payload = {
+    contents: contents,
+    systemInstruction: {
+      parts: [{ text: systemInstruction }]
+    },
+    generationConfig: {
+      temperature: 0.2
+    }
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+    const responseText = response.getContentText();
+
+    if (responseCode === 200) {
+      const resJson = JSON.parse(responseText);
+      if (resJson.candidates && resJson.candidates[0].content && resJson.candidates[0].content.parts && resJson.candidates[0].content.parts[0].text) {
+        return resJson.candidates[0].content.parts[0].text;
+      }
+    } else {
+      Logger.log(`Gemini API Error: Code ${responseCode} | Details: ${responseText}`);
+      writeLog("SYSTEM", "GEMINI_API_ERROR", `HTTP Code: ${responseCode}`);
+    }
+  } catch (err) {
+    Logger.log("Gemini API Exception: " + err.message);
+    writeLog("SYSTEM", "GEMINI_API_EXCEPTION", err.message);
+  }
+  return null; // สลับไปใช้ออฟไลน์ fallback
+}
+
 /**
  * วิเคราะห์ความต้องการคำขอรายงานข้อมูลและแนะนำตรรกะ SQL (HOSxP MySQL) ผ่าน AI พร้อมระบบ Fallback
  */
-function askGeminiToAnalyzeRequest(requestId) {
+function askGeminiToAnalyzeRequest(requestId, sessionToken) {
   try {
+    const session = requireSession(sessionToken, "", true);
+    if (!session.ok) return { success: false, message: session.message };
     ensureHeaders();
     const sheet = getSheet(SHEET_NAME_REQUESTS);
     const data = sheet.getDataRange().getValues();
@@ -1169,6 +1678,13 @@ function askGeminiToAnalyzeRequest(requestId) {
    - เมื่อต้องการดึงชื่อสิทธิ์ หรือชื่อแพทย์ ให้ทำ LEFT JOIN กับตาราง pttype หรือ doctor
 5. ความปลอดภัย: หากข้อมูลในคำขอไม่ชัดเจน ให้เขียน SQL ที่ปลอดภัยและสมเหตุสมผลที่สุด พร้อมคอมเมนต์บอกข้อจำกัดไว้ในโค้ด`;
 
+    // 1. เรียกใช้งาน Gemini API จริงก่อน
+    const realAiText = callGeminiAPI(userPrompt, systemInstruction);
+    if (realAiText) {
+      return { success: true, analysis: realAiText };
+    }
+
+    // 2. หากพลาด ให้เปลี่ยนมาใช้ระบบ Offline Rule Engine (Fallback)
     const aiResult = getAIResponseWithFallback(userPrompt, systemInstruction);
     if (!aiResult.success) return aiResult;
 
@@ -1181,10 +1697,40 @@ function askGeminiToAnalyzeRequest(requestId) {
 /**
  * คุยกับ Chatbot แบบโต้ตอบผ่าน AI พร้อมระบบ Fallback
  */
-function askGeminiChat(history, role) {
+function askGeminiChat(history, role, sessionToken) {
   try {
+    const session = requireSession(sessionToken);
+    if (!session.ok) return { success: false, message: session.message };
+    role = session.user.role;
     let systemInstruction = "";
     if (role === ADMIN_ROLE) {
+      let recentApprovedContext = "";
+      try {
+        const sheet = getSheet(SHEET_NAME_REQUESTS);
+        const data = sheet.getDataRange().getValues();
+        const completedRequests = [];
+        for (let i = data.length - 1; i >= 1; i--) {
+          const row = data[i];
+          if (row[10] === "เสร็จสิ้น" && row[11]) { // status = เสร็จสิ้น และมี adminNote
+            const sql = extractSqlFromNote_(row[11]);
+            if (sql) {
+              completedRequests.push({
+                reportType: row[5],
+                purpose: row[8],
+                sql: sql
+              });
+            }
+            if (completedRequests.length >= 6) break; // ดึงมาสูงสุด 6 รายการ
+          }
+        }
+        if (completedRequests.length > 0) {
+          recentApprovedContext = "\n\n### ตัวอย่างคำขอรายงานที่ทำเสร็จแล้วล่าสุด (ใช้อ้างอิงเป็นตัวอย่างการสร้างตารางและเขียน SQL):\n" +
+            completedRequests.map(r => `• รายงาน: ${r.reportType}\n  วัตถุประสงค์: ${r.purpose}\n  คำสั่ง SQL:\n  \`\`\`sql\n${r.sql}\n  \`\`\``).join("\n\n");
+        }
+      } catch (err) {
+        Logger.log("ไม่สามารถดึงข้อมูลรายงานย้อนหลังเป็นบริบทได้: " + err.message);
+      }
+
       systemInstruction = `คุณคือ AI ผู้ช่วยอัจฉริยะสำหรับ IT ในการวิเคราะห์ตารางและเขียน SQL HOSxP (MySQL/MariaDB)
 ทุกครั้งที่ให้ SQL ต้องครอบด้วย markdown code block (\`\`\`sql ... \`\`\`) และอธิบายเหตุผลสั้นๆ
 
@@ -1208,18 +1754,207 @@ function askGeminiChat(history, role) {
 ### กฎสำคัญ:
 1. ดึงสิทธิ์คนไข้ หรือตึก ให้ LEFT JOIN ตาราง pttype หรือ ward เสมอ
 2. เชื่อมโยงธุรกรรมการเงิน/ยา (opitemrece) ของผู้ป่วยนอก (OPD) ใช้ vn ส่วนผู้ป่วยใน (IPD) ใช้ an เสมอ เพื่อป้องกันข้อมูลซ้ำซ้อน
-3. การกรองวันที่ ให้ระบุ Placeholder เป็น :start_date และ :end_date เพื่อความยืดหยุ่นในการดึงรายงาน`;
+3. การกรองวันที่ ให้ระบุ Placeholder เป็น :start_date และ :end_date เพื่อความยืดหยุ่นในการดึงรายงาน${recentApprovedContext}`;
     } else {
+      let popularReports = "";
+      try {
+        const sheet = getSheet(SHEET_NAME_REQUESTS);
+        const data = sheet.getDataRange().getValues();
+        const counts = {};
+        for (let i = 1; i < data.length; i++) {
+          const type = data[i][5];
+          if (type) counts[type] = (counts[type] || 0) + 1;
+        }
+        const topTypes = Object.keys(counts).sort((a,b) => counts[b] - counts[a]).slice(0, 5);
+        if (topTypes.length > 0) {
+          popularReports = "\n\n### รายงานยอดนิยมที่มีเพื่อนร่วมงานของคุณขอเข้ามาบ่อยที่สุดล่าสุด:\n" + 
+            topTypes.map((t, idx) => `• ${t} (ขอแล้ว ${counts[t]} ครั้ง)`).join("\n");
+        }
+      } catch (err) {
+        Logger.log("ไม่สามารถดึงความนิยมรายงานได้: " + err.message);
+      }
+
       systemInstruction = "คุณคือ AI ผู้ช่วยอัจฉริยะสำหรับบุคลากรทางการแพทย์ในระบบขอรายงาน HosXP\n" +
-        "ห้ามแสดง SQL หรือชื่อตารางเชิงเทคนิคให้ผู้ใช้เห็นเด็ดขาด ให้แนะนำวิธีอธิบายรายงานที่ดีและแนะนำการกรอกแบบฟอร์มขอรายงานแทน";
+        "ห้ามแสดง SQL หรือชื่อตารางเชิงเทคนิคให้ผู้ใช้เห็นเด็ดขาด ให้แนะนำวิธีอธิบายรายงานที่ดีและแนะนำการกรอกแบบฟอร์มขอรายงานแทน" + popularReports;
     }
 
-    const lastMessage = history.pop().text;
-    const aiResult = getAIResponseWithFallback(lastMessage, systemInstruction, history);
+    const lastMessage = history[history.length - 1].text;
+    const historySlice = history.slice(0, -1);
+
+    // 1. เรียกใช้งาน Gemini API จริงก่อน
+    const realAiResponse = callGeminiAPI(lastMessage, systemInstruction, historySlice);
+    if (realAiResponse) {
+      return { success: true, response: realAiResponse };
+    }
+
+    // 2. หากพลาด ให้เปลี่ยนมาใช้ระบบ Offline Rule Engine (Fallback)
+    const lastMessageFallback = history.pop().text;
+    const aiResult = getAIResponseWithFallback(lastMessageFallback, systemInstruction, history);
     
     if (!aiResult.success) return aiResult;
     return { success: true, response: aiResult.text };
   } catch (e) {
     return { success: false, message: "เกิดข้อผิดพลาดในการประมวลผลแชท: " + e.message };
+  }
+}
+
+function extractSqlFromNote_(note) {
+  if (!note) return "";
+  const match = note.match(/SELECT[\s\S]+?;/i) || note.match(/SELECT[\s\S]+/i);
+  return match ? match[0].trim() : note.trim();
+}
+
+// ─── UPLOAD FILE TO DRIVE ───────────────────────────────────────
+function uploadFileToDrive(base64Data, fileName, mimeType, sessionToken) {
+  try {
+    const session = requireSession(sessionToken, "", true);
+    if (!session.ok) return { success: false, message: session.message };
+    return uploadFileToDrive_(base64Data, fileName, mimeType);
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+// ฟังก์ชันภายใน: ใช้จาก doPost หลังตรวจ API token แล้วเท่านั้น
+function uploadFileToDrive_(base64Data, fileName, mimeType, requestId) {
+  try {
+    if (!base64Data || !fileName) return { success: false, message: "ไม่พบข้อมูลไฟล์" };
+    const safeFileName = String(fileName).replace(/[^a-zA-Z0-9._()\-ก-๙ ]/g, "_").slice(0, 150);
+    const maxBytes = 20 * 1024 * 1024;
+    // กำหนด MIME Type ตามนามสกุลไฟล์ หาก client ส่งค่าว่างมา หรือเป็นค่าเริ่มต้นที่ไม่สมบูรณ์
+    if (!mimeType || mimeType === "") {
+      const ext = fileName.split('.').pop().toLowerCase();
+      const mimeTypes = {
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'xls': 'application/vnd.ms-excel',
+        'csv': 'text/csv',
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'gif': 'image/gif',
+        'zip': 'application/zip',
+        'txt': 'text/plain'
+      };
+      mimeType = mimeTypes[ext] || 'application/octet-stream';
+    }
+
+    const byteCharacters = Utilities.base64Decode(base64Data);
+    if (byteCharacters.length > maxBytes) return { success: false, message: "ไฟล์มีขนาดเกิน 20 MB" };
+    const blob = Utilities.newBlob(byteCharacters, mimeType, safeFileName);
+    
+    // ค้นหาหรือสร้างโฟลเดอร์สำหรับเก็บรายงาน
+    const folderName = "HosXP_Completed_Reports";
+    let folder;
+    const folders = DriveApp.getFoldersByName(folderName);
+    if (folders.hasNext()) {
+      folder = folders.next();
+    } else {
+      folder = DriveApp.createFolder(folderName);
+    }
+    
+    const file = folder.createFile(blob);
+    
+    let shared = false;
+    if (requestId) {
+      try {
+        const sheet = getSheet(SHEET_NAME_REQUESTS);
+        const data = sheet.getDataRange().getValues();
+        for (let i = 1; i < data.length; i++) {
+          if (data[i][0] === requestId) {
+            const email = data[i][3]; // requesterEmail
+            if (email && email.includes("@")) {
+              file.addViewer(email.trim());
+              shared = true;
+            }
+            break;
+          }
+        }
+      } catch (err) {
+        writeLog("SYSTEM_ERROR", "SHARE_FILE_ERROR", err.message);
+      }
+    }
+
+    if (!shared) {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      writeLog("SECURITY_WARNING", "FILE_SHARED_PUBLICLY", `ไฟล์ถูกแชร์สาธารณะเนื่องจากไม่พบอีเมลผู้ขอ: ${safeFileName}`);
+    } else {
+      writeLog("SYSTEM", "FILE_SHARED_SECURELY", `แชร์ไฟล์แบบปลอดภัยให้กับผู้ขอเรียบร้อยแล้ว: ${safeFileName}`);
+    }
+    
+    return {
+      success: true,
+      url: file.getUrl(), // ใช้ URL หน้าตัวอย่างแสดงผลที่เปิดดูและดาวน์โหลดได้ง่าย
+      downloadUrl: file.getDownloadUrl()
+    };
+  } catch (e) {
+    return { success: false, message: e.message };
+  }
+}
+
+/**
+ * ย้ายข้อมูลคำขอรายงานที่ทำเสร็จสิ้นหรือถูกปฏิเสธ (ที่มีอายุเกิน 90 วัน) ไปเก็บในแผ่นงาน Archive
+ */
+function archiveOldRequests() {
+  try {
+    const activeSheet = getSheet(SHEET_NAME_REQUESTS);
+    const data = activeSheet.getDataRange().getValues();
+    if (data.length <= 1) {
+      return { success: true, archivedCount: 0, message: "ไม่มีข้อมูลคำขอให้ประมวลผล" };
+    }
+    
+    const headers = data[0];
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 90);
+    
+    const eligibleRows = []; // To hold row numbers and values: { rowNum, values }
+    
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const status = (row[10] || "").toString().trim();
+      const updatedAtStr = row[13];
+      
+      if (status === "เสร็จสิ้น" || status === "ปฏิเสธ") {
+        const updatedAt = new Date(updatedAtStr);
+        if (!isNaN(updatedAt.getTime()) && updatedAt < cutoffDate) {
+          eligibleRows.push({
+            rowNum: i + 1, // 1-indexed row number in sheet
+            values: row
+          });
+        }
+      }
+    }
+    
+    if (eligibleRows.length === 0) {
+      return { success: true, archivedCount: 0, message: "ไม่พบคำขอเก่าที่ตรงตามเงื่อนไขย้ายประวัติ (เสร็จสิ้น/ปฏิเสธ เกิน 90 วัน)" };
+    }
+    
+    // Open or create Archive sheet
+    const archiveSheet = getSheet("Archive_Requests");
+    if (archiveSheet.getLastRow() === 0) {
+      archiveSheet.appendRow(headers);
+      archiveSheet.getRange(1, 1, 1, headers.length)
+        .setFontWeight("bold")
+        .setBackground("#5f6368")
+        .setFontColor("#ffffff");
+    }
+    
+    // Append eligible rows to Archive sheet
+    const valuesToAppend = eligibleRows.map(r => r.values);
+    archiveSheet.getRange(archiveSheet.getLastRow() + 1, 1, valuesToAppend.length, headers.length)
+      .setValues(valuesToAppend);
+    
+    // Delete rows from the active sheet in reverse order to prevent shifting
+    for (let j = eligibleRows.length - 1; j >= 0; j--) {
+      activeSheet.deleteRow(eligibleRows[j].rowNum);
+    }
+    
+    writeLog("SYSTEM", "ARCHIVE_OLD_REQUESTS", `ย้ายประวัติคำขอเก่าสำเร็จ ${eligibleRows.length} รายการ ไปยัง Archive_Requests`);
+    return { success: true, archivedCount: eligibleRows.length, message: `ย้ายข้อมูลเก่าเรียบร้อยแล้วจำนวน ${eligibleRows.length} รายการ` };
+  } catch (e) {
+    writeLog("SYSTEM_ERROR", "ARCHIVE_ERROR", e.message);
+    return { success: false, message: "เกิดข้อผิดพลาดในการย้ายข้อมูล: " + e.message };
   }
 }

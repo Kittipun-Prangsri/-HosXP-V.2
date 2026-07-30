@@ -1,0 +1,13 @@
+node_modules/**
+.venv/**
+**/.venv/**
+.git/**
+*.py
+requirements.txt
+*.md
+*.env
+*.env.example
+*.gsheet
+telegram_hosxp_bot.py
+INTEGRATION_GUIDE.md
+README.md

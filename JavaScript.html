@@ -4,6 +4,7 @@
 // ============================================================
 const App = {
   user:         null,
+  sessionToken: null,
   requests:     [],
   allUsers:     [], // เพื่อเก็บข้อมูลผู้ใช้ทั้งหมดสำหรับแอดมิน
   currentReq:   null,
@@ -11,6 +12,10 @@ const App = {
   filterStatus: "",
   filterDept:   "",
   searchQuery:  "",
+  quickFilter:  "",
+  sortRequests: "created-desc",
+  requestPage:  1,
+  notifications: [],
 };
 
 let dashboardTimer = null; // ตัวตั้งเวลาสำหรับระบบ Real-time Dashboard
@@ -25,7 +30,7 @@ const GS = {
         google.script.run
           .withSuccessHandler(resolve)
           .withFailureHandler(err => resolve({ success: false, message: err.message }))
-          [fn](...args);
+          [fn](...args, ...(fn === "login" ? [] : [App.sessionToken]));
       } else {
         // Fallback สำหรับใช้งานตรวจสอบรีวิวบนคอมพิวเตอร์ (Mock Data)
         resolve(MockData[fn](...args));
@@ -38,7 +43,7 @@ const GS = {
 //  3. MOCK DATA ENGINE (สำหรับจำลองระบบ)
 // ============================================================
 const MOCK_REQUESTS = [
-  { id:"1", requestNo:"REQ250523-0001", requesterName:"กิตติศักดิ์ ศรีราศรี", requesterEmail:"doctor01@hospital.go.th", department:"อายุรกรรม", reportType:"รายงานผู้ป่วยนอก (OPD)", dateFrom:"2026-05-23T00:00:00.000Z", dateTo:"2026-05-24T00:00:00.000Z", purpose:"ดึงรายงาน", urgency:"ปกติ", status:"รอดำเนินการ", adminNote:"", createdAt:"2026-06-01T09:00:00Z", updatedAt:"2026-06-01T09:00:00Z", createdBy:"doctor01" }
+  { id:"1", requestNo:"REQ250523-0001", requesterName:"กิตติศักดิ์ ศรีราศรี", requesterEmail:"doctor01@hospital.go.th", department:"อายุรกรรม", reportType:"รายงานผู้ป่วยนอก (OPD)", dateFrom:"2026-05-23T00:00:00.000Z", dateTo:"2026-05-24T00:00:00.000Z", purpose:"ดึงรายงาน", urgency:"ปกติ", status:"รอดำเนินการ", adminNote:"", createdAt:"2026-06-01T09:00:00Z", updatedAt:"2026-06-01T09:00:00Z", createdBy:"doctor01", downloadUrl:"" }
 ];
 
 const MOCK_USERS = [
@@ -60,13 +65,14 @@ const MockData = {
       processing: MOCK_REQUESTS.filter(r=>r.status==="กำลังดำเนินการ").length,
       completed: MOCK_REQUESTS.filter(r=>r.status==="เสร็จสิ้น").length,
       rejected: MOCK_REQUESTS.filter(r=>r.status==="ปฏิเสธ").length,
+      inboxCount: MOCK_REQUESTS.filter(r=>r.status==="เสร็จสิ้น" && r.downloadUrl).length,
       recent: MOCK_REQUESTS.slice(-5).reverse()
     }};
   },
   createRequest(payload, username) {
     const id = "mock-" + Date.now();
     const requestNo = "REQ" + Date.now().toString().slice(-6);
-    MOCK_REQUESTS.push({ id, requestNo, ...payload, status:"รอดำเนินการ", adminNote:"", createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), createdBy:username });
+    MOCK_REQUESTS.push({ id, requestNo, ...payload, status:"รอดำเนินการ", adminNote:"", createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), createdBy:username, downloadUrl:"" });
     return { success: true, id, requestNo };
   },
   updateRequest(id, payload) {
@@ -103,7 +109,14 @@ const MockData = {
     }
     return { success: false, message: "ไม่พบผู้ใช้ที่ต้องการแก้ไข" };
   },
-  testTelegramNotification(chatId) { return { success: true, message: "ส่งข้อความทดสอบเข้า Telegram แล้ว" }; }
+  testTelegramNotification(chatId) { return { success: true, message: "ส่งข้อความทดสอบเข้า Telegram แล้ว" }; },
+  uploadFileToDrive(base64Data, fileName, mimeType) {
+    return {
+      success: true,
+      url: "https://docs.google.com/spreadsheets/d/mock-file-url",
+      downloadUrl: "https://docs.google.com/spreadsheets/d/mock-file-url"
+    };
+  }
 };
 
 // ════════════════════════════════════════════════════════
@@ -131,8 +144,55 @@ function statusBadge(s) {
   return `<span class="badge ${map[s]||'badge-normal'}">${s}</span>`;
 }
 function urgencyBadge(u) {
-  const map = { "ด่วนที่สุด":"badge-urgent","สูง":"badge-high","ปกติ":"badge-normal" };
+  const map = { "ด่วนที่สุด":"badge-urgent", "เร่งด่วน":"badge-urgent", "สูง":"badge-high", "ปกติ":"badge-normal" };
   return `<span class="badge ${map[u]||'badge-normal'}">${u}</span>`;
+}
+
+function isMine(r) {
+  return r.createdBy === App.user?.displayName || String(r.createdBy || "").trim() === String(App.user?.username || "").trim() || r.requesterName === App.user?.displayName;
+}
+
+function isOverdue(r) {
+  return r.neededDate && !["เสร็จสิ้น", "ปฏิเสธ"].includes(r.status) && new Date(r.neededDate + "T23:59:59") < new Date();
+}
+
+function urgencyRank(u) { return ({ "ด่วนที่สุด":3, "เร่งด่วน":3, "สูง":2, "ปกติ":1 })[u] || 0; }
+
+function addNotification(title, body) {
+  App.notifications.unshift({ title, body, time: new Date().toISOString() });
+  App.notifications = App.notifications.slice(0, 20);
+  renderNotifications();
+}
+
+function renderNotifications() {
+  const list = document.getElementById("notification-list");
+  const count = document.getElementById("notification-count");
+  if (count) { count.textContent = App.notifications.length; count.style.display = App.notifications.length ? "block" : "none"; }
+  if (!list) return;
+  list.innerHTML = App.notifications.length ? App.notifications.map(n => `<div class="notification-item"><span>🔔</span><div><strong>${n.title}</strong><p>${n.body} · ${formatThaiDate(n.time)}</p></div></div>`).join("") : `<div class="empty-state"><div class="empty-icon">🔕</div><p>ยังไม่มีการแจ้งเตือนใหม่</p></div>`;
+}
+
+function saveRequestPreferences() {
+  try { localStorage.setItem("hosxp_request_preferences", JSON.stringify({ quickFilter: App.quickFilter, sortRequests: App.sortRequests })); } catch (e) {}
+}
+
+function restoreRequestPreferences() {
+  try {
+    const p = JSON.parse(localStorage.getItem("hosxp_request_preferences") || "{}");
+    App.quickFilter = p.quickFilter || "";
+    App.sortRequests = p.sortRequests || "created-desc";
+    const sort = document.getElementById("sort-requests");
+    if (sort) sort.value = App.sortRequests;
+  } catch (e) {}
+}
+
+async function copyTicketId(ticketId) {
+  try {
+    await navigator.clipboard.writeText(ticketId);
+    toast("คัดลอก Ticket ID แล้ว", "success");
+  } catch (e) {
+    toast("ไม่สามารถคัดลอก Ticket ID ได้", "error");
+  }
 }
 function formatDate(iso) {
   if (!iso) return "-";
@@ -194,14 +254,14 @@ async function doLogin() {
     const res = await GS.call("login", u, p);
     if (res.success) {
       App.user = res.user;
+      App.sessionToken = res.sessionToken || null;
       const rem = document.getElementById("login-remember");
       if (rem && rem.checked) {
         localStorage.setItem("hosxp_username", u);
-        localStorage.setItem("hosxp_password", p);
       } else {
         localStorage.removeItem("hosxp_username");
-        localStorage.removeItem("hosxp_password");
       }
+      localStorage.removeItem("hosxp_password");
       
       startApp();
     } else {
@@ -223,7 +283,7 @@ function showLoginError(msg) {
 }
 
 function logout() {
-  App.user = null; App.requests = [];
+  App.user = null; App.sessionToken = null; App.requests = [];
   clearInterval(dashboardTimer);
   
   // รีเซ็ตแผงประวัติการคุยและการแสดงผลของ AI
@@ -304,7 +364,7 @@ function navigate(page) {
   const nav = document.querySelector(`[data-page="${page}"]`);
   if (nav) nav.classList.add("active");
   
-  const titles = { dashboard:"แดชบอร์ด", requests:"คำขอรายงาน", "new-request":"สร้างคำขอใหม่", logs:"บันทึกกิจกรรม", users:"จัดการผู้ใช้", settings:"จัดการโปรไฟล์ส่วนตัว" };
+  const titles = { dashboard:"แดชบอร์ด", requests:"คำขอรายงาน", inbox:"กล่องรับเข้าไฟล์", "new-request":"สร้างคำขอใหม่", logs:"บันทึกกิจกรรม", users:"จัดการผู้ใช้", settings:"จัดการโปรไฟล์ส่วนตัว" };
   document.getElementById("page-title").textContent = titles[page] || page;
   
   clearInterval(dashboardTimer);
@@ -317,6 +377,7 @@ function navigate(page) {
     }, 30000);
   }
   if (page === "requests") loadRequests();
+  if (page === "inbox") loadInbox();
   if (page === "logs") loadLogs();
   if (page === "users") loadUsers();
   if (page === "settings") loadSettings();
@@ -402,6 +463,8 @@ async function testPersonalTelegram() {
 //  7. DASHBOARD ENGINE
 // ============================================================
 let dashboardFilter = "";
+let urgencyChartInstance = null;
+let departmentChartInstance = null;
 
 async function loadDashboard() {
   const res = await GS.call("getDashboardStats", App.user.username, App.user.role, App.user.displayName);
@@ -446,11 +509,23 @@ async function loadDashboard() {
     }
   }
 
+  // อัปเดตตัวเลข Sidebar Badge สำหรับ Inbox
+  const inboxBadge = document.getElementById("nav-badge-inbox");
+  if (inboxBadge) {
+    if (d.inboxCount > 0) {
+      inboxBadge.textContent = d.inboxCount;
+      inboxBadge.style.display = "inline-block";
+    } else {
+      inboxBadge.style.display = "none";
+    }
+  }
+
   // ตรวจจับคำขอใหม่และแจ้งเตือน In-App
   if (App.user && App.user.role === "admin") {
     if (App.lastPendingCount !== -1 && d.pending > App.lastPendingCount) {
       playNotificationSound();
       toast("🔔 มีคำขอรายงานใหม่เข้าระบบ!", "info");
+      addNotification("มีคำขอรายงานใหม่", `ขณะนี้มี ${d.pending} รายการรอดำเนินการ`);
     }
     App.lastPendingCount = d.pending;
   }
@@ -480,6 +555,98 @@ async function loadDashboard() {
       ${statusBadge(r.status)}
     </div>`;
   }).join("");
+
+  renderActionQueue(App.requests.length ? App.requests : (d.recent || []));
+  renderInteractiveCharts(d.urgency, d.depts);
+}
+
+function renderInteractiveCharts(urgencyData, deptData) {
+  // 1. Urgency Chart (Doughnut Chart)
+  const ctxUrgency = document.getElementById("urgencyChart")?.getContext("2d");
+  if (ctxUrgency) {
+    if (urgencyChartInstance) urgencyChartInstance.destroy();
+    
+    const labels = Object.keys(urgencyData || {});
+    const counts = Object.values(urgencyData || {});
+    
+    urgencyChartInstance = new Chart(ctxUrgency, {
+      type: 'doughnut',
+      data: {
+        labels: labels,
+        datasets: [{
+          data: counts,
+          backgroundColor: [
+            '#2FB67E', // ปกติ - เขียว
+            '#F3B34C', // สูง - ส้ม
+            '#DE5D4E', // ด่วนที่สุด - แดง
+            '#9c27b0', // สีอื่น
+            '#3f51b5'
+          ],
+          borderWidth: 2,
+          borderColor: '#ffffff'
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: {
+              boxWidth: 12,
+              font: { family: 'Sarabun, sans-serif', size: 11 }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // 2. Department Chart (Horizontal/Vertical Bar Chart)
+  const ctxDept = document.getElementById("departmentChart")?.getContext("2d");
+  if (ctxDept) {
+    if (departmentChartInstance) departmentChartInstance.destroy();
+
+    const labels = (deptData || []).map(item => item.name);
+    const counts = (deptData || []).map(item => item.count);
+
+    departmentChartInstance = new Chart(ctxDept, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'จำนวนคำขอ',
+          data: counts,
+          backgroundColor: 'rgba(13, 148, 136, 0.75)', // Primary teal color
+          hoverBackgroundColor: 'rgba(13, 148, 136, 0.95)',
+          borderRadius: 6,
+          borderWidth: 0
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: false
+          }
+        },
+        scales: {
+          x: {
+            grid: { display: false },
+            ticks: { font: { family: 'Sarabun, sans-serif', size: 10 } }
+          },
+          y: {
+            beginAtZero: true,
+            ticks: {
+              stepSize: 1,
+              font: { family: 'Sarabun, sans-serif', size: 10 }
+            }
+          }
+        }
+      }
+    });
+  }
 }
 
 function resetDashboardFilter() {
@@ -487,12 +654,30 @@ function resetDashboardFilter() {
   loadDashboard();
 }
 
+function renderActionQueue(source) {
+  const el = document.getElementById("action-queue");
+  if (!el) return;
+  const rows = source.filter(r => !["เสร็จสิ้น", "ปฏิเสธ"].includes(r.status)).sort((a, b) => {
+    const urgency = urgencyRank(b.urgency) - urgencyRank(a.urgency);
+    if (urgency) return urgency;
+    return new Date(a.neededDate || "2999-12-31") - new Date(b.neededDate || "2999-12-31");
+  }).slice(0, 5);
+  el.innerHTML = rows.length ? rows.map(r => `<div class="queue-item" onclick="showDetail('${r.id}')"><div class="recent-dot" style="background:${isOverdue(r) ? 'var(--red)' : statusColor(r.status)}"></div><div class="queue-main"><div class="queue-title">${r.requestNo} · ${r.reportType}</div><div class="queue-meta">${r.department || '-'} · <span class="${isOverdue(r) ? 'due-overdue' : ''}">${isOverdue(r) ? 'เกินกำหนด' : 'ต้องการรับ ' + formatThaiDate(r.neededDate)}</span></div></div>${urgencyBadge(r.urgency)}</div>`).join("") : `<div class="empty-state"><p>ไม่มีงานที่กำลังรอดำเนินการ</p></div>`;
+}
+
+function openActionQueue() {
+  navigate("requests");
+  App.quickFilter = "pending";
+  App.requestPage = 1;
+  renderTable();
+}
+
 // ============================================================
 //  8. REQUESTS QUEUE MANAGEMENT (TRANSPARENT QUEUE)
 // ============================================================
 async function loadRequests() {
   const res = await GS.call("getRequests", App.user.username, App.user.role, App.user.displayName);
-  if (res && res.success) { App.requests = res.data; renderTable(); }
+  if (res && res.success) { App.requests = res.data; renderTable(); renderActionQueue(App.requests); }
 }
 
 function renderTable() {
@@ -500,21 +685,36 @@ function renderTable() {
   const tbody = document.getElementById("requests-tbody");
   if (!tbody) return;
 
-  const rows = App.requests.filter(r => {
+  let rows = App.requests.filter(r => {
     const qs = App.searchQuery.toLowerCase();
     const matchSearch = !qs || [r.requestNo, r.requesterName, r.department, r.reportType].some(v => (v || "").toLowerCase().includes(qs));
     const matchStatus = !App.filterStatus || r.status === App.filterStatus;
     const matchDept = !App.filterDept || r.department === App.filterDept;
-    return matchSearch && matchStatus && matchDept;
+    const matchQuick = !App.quickFilter || (App.quickFilter === "mine" && isMine(r)) || (App.quickFilter === "pending" && r.status === "รอดำเนินการ") || (App.quickFilter === "urgent" && urgencyRank(r.urgency) >= 3) || (App.quickFilter === "overdue" && isOverdue(r));
+    return matchSearch && matchStatus && matchDept && matchQuick;
   });
+
+  rows.sort((a, b) => {
+    if (App.sortRequests === "needed-asc") return new Date(a.neededDate || "2999-12-31") - new Date(b.neededDate || "2999-12-31");
+    if (App.sortRequests === "urgency-desc") return urgencyRank(b.urgency) - urgencyRank(a.urgency) || new Date(b.createdAt) - new Date(a.createdAt);
+    return new Date(b.createdAt) - new Date(a.createdAt);
+  });
+
+  document.querySelectorAll(".quick-filter").forEach(b => b.classList.toggle("active", b.dataset.quickFilter === App.quickFilter));
+  const pageSize = 10;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  App.requestPage = Math.min(App.requestPage, totalPages);
+  const pageRows = rows.slice((App.requestPage - 1) * pageSize, App.requestPage * pageSize);
 
   if (rows.length === 0) {
     tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state">ไม่พบรายการคิวคำขอ</div></td></tr>`;
+    const pager = document.getElementById("table-pagination");
+    if (pager) pager.innerHTML = "";
     return;
   }
 
-  tbody.innerHTML = rows.map(r => {
-    const isOwner = (r.createdBy === App.user.displayName || String(r.createdBy).trim() === String(App.user.username).trim() || r.requesterName === App.user.displayName);
+  tbody.innerHTML = pageRows.map(r => {
+    const isOwner = isMine(r);
     const canEdit = isAdmin || (isOwner && r.status === "รอดำเนินการ");
     const canDelete = isAdmin || (isOwner && r.status === "รอดำเนินการ");
     
@@ -534,13 +734,18 @@ function renderTable() {
         <div class="td-actions">
           <button class="btn btn-sm btn-secondary btn-icon" title="ดู" onclick="showDetail('${r.id}')">👁️</button>
           ${canEdit ? `<button class="btn btn-sm btn-secondary btn-icon" title="แก้ไข" onclick="openEditModal('${r.id}')">✏️</button>` : ''}
+          ${r.downloadUrl ? `<a href="${r.downloadUrl}" target="_blank" class="btn btn-sm btn-secondary btn-icon" title="ดาวน์โหลดไฟล์รายงาน" style="text-decoration:none; display:inline-flex; align-items:center; justify-content:center;" onclick="writeLogDownload('${r.requestNo}')">📥</a>` : ''}
           <button class="btn btn-sm btn-secondary btn-icon" title="PDF" onclick="openPdfModal('${r.id}')">📄</button>
           ${canDelete ? `<button class="btn btn-sm btn-danger btn-icon" title="ลบ" onclick="confirmDelete('${r.id}')">🗑️</button>` : ""}
         </div>
       </td>
     </tr>`;
   }).join("");
+  const pager = document.getElementById("table-pagination");
+  if (pager) pager.innerHTML = rows.length > pageSize ? `<span>หน้า ${App.requestPage} / ${totalPages} · ${rows.length} รายการ</span><button class="btn btn-secondary btn-sm" ${App.requestPage === 1 ? "disabled" : ""} onclick="changeRequestPage(-1)">ก่อนหน้า</button><button class="btn btn-secondary btn-sm" ${App.requestPage === totalPages ? "disabled" : ""} onclick="changeRequestPage(1)">ถัดไป</button>` : rows.length ? `<span>${rows.length} รายการ</span>` : "";
 }
+
+function changeRequestPage(delta) { App.requestPage += delta; renderTable(); }
 
 // ============================================================
 //  9. MODALS & FORMS LOGIC
@@ -565,7 +770,7 @@ function setFormPriority(p) {
   
   if (p === 'ปกติ' && low) low.classList.add('sel-low');
   if (p === 'สูง' && normal) normal.classList.add('sel-normal');
-  if (p === 'เร่งด่วน' && urgent) urgent.classList.add('sel-urgent');
+  if (p === 'ด่วนที่สุด' && urgent) urgent.classList.add('sel-urgent');
   updateFormStepsProgress();
 }
 
@@ -657,6 +862,8 @@ function showDetail(id) {
     <div class="detail-item" style="grid-column:1/-1"><label>วัตถุประสงค์การใช้งาน</label><div class="value" style="white-space: pre-wrap;">${r.purpose}</div></div>
     ${r.additionalNote ? `<div class="detail-item detail-note" style="grid-column:1/-1; background:#e8f0fe; border-left-color:#1a73e8;"><label>หมายเหตุ / ข้อมูลเพิ่มเติมจากผู้ขอ</label><div class="value" style="white-space: pre-wrap;">${r.additionalNote}</div></div>` : ""}
     ${r.adminNote ? `<div class="detail-item detail-note" style="grid-column:1/-1"><label>หมายเหตุ Admin / ไอที</label><div class="value" style="white-space: pre-wrap;">${r.adminNote}</div></div>` : ""}
+    ${r.downloadUrl ? `<div class="detail-item detail-note" style="grid-column:1/-1; background:var(--green-bg); border-left-color:var(--green); color:#064e3b;"><label style="color:var(--primary-dark)">📥 ลิงก์ดาวน์โหลดรายงาน</label><div class="value" style="margin-top:8px;"><a href="${r.downloadUrl}" target="_blank" class="btn btn-primary btn-sm" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none; background:var(--primary-gradient);" onclick="writeLogDownload('${r.requestNo}')">💾 ดาวน์โหลดไฟล์รายงาน</a></div></div>` : ""}
+    <div class="detail-item timeline-panel" style="grid-column:1/-1"><label>ความคืบหน้าคำขอ</label>${requestTimeline(r)}</div>
   `;
   const editBtn = document.getElementById("detail-edit-btn");
   if (editBtn) {
@@ -665,7 +872,186 @@ function showDetail(id) {
   if (aiBtn) {
     aiBtn.style.display = isAdmin ? "" : "none";
   }
+
+  // ─── ADMIN QUICK COMPLETION SECTION CONTROL ───
+  const adminUploadSec = document.getElementById("detail-admin-upload-section");
+  if (adminUploadSec) {
+    if (isAdmin && r.status !== "เสร็จสิ้น" && r.status !== "ปฏิเสธ") {
+      adminUploadSec.style.display = "block";
+      document.getElementById("detail-upload-admin-note").value = "";
+      const statusWrap = document.getElementById("detail-upload-status");
+      if (statusWrap) statusWrap.style.display = "none";
+      const fileInput = document.getElementById("detail-upload-file-input");
+      if (fileInput) fileInput.value = "";
+      
+      initDetailDragAndDrop();
+    } else {
+      adminUploadSec.style.display = "none";
+    }
+  }
+
   openModal("modal-detail");
+}
+
+let detailDragDropInitialized = false;
+
+function initDetailDragAndDrop() {
+  if (detailDragDropInitialized) return;
+  detailDragDropInitialized = true;
+  
+  const dropzone = document.getElementById("detail-upload-dropzone");
+  const fileInput = document.getElementById("detail-upload-file-input");
+  
+  if (!dropzone || !fileInput) return;
+  
+  // Click dropzone to trigger file input
+  dropzone.addEventListener("click", () => fileInput.click());
+  
+  // File input change
+  fileInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (file) handleDetailFileUpload(file);
+  });
+  
+  // Drag over
+  dropzone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.add("drag-over");
+  });
+  
+  // Drag leave
+  dropzone.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove("drag-over");
+  });
+  
+  // Drop
+  dropzone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.remove("drag-over");
+    
+    const file = e.dataTransfer.files[0];
+    if (file) handleDetailFileUpload(file);
+  });
+}
+
+async function handleDetailFileUpload(file) {
+  if (!file) return;
+  
+  // จำกัดขนาดไฟล์ไม่เกิน 25 MB
+  if (file.size > 25 * 1024 * 1024) {
+    toast("ขนาดไฟล์ใหญ่เกินไป (จำกัดไม่เกิน 25MB)", "error");
+    return;
+  }
+  
+  const statusWrap = document.getElementById("detail-upload-status");
+  const statusText = document.getElementById("detail-upload-status-text");
+  const percentText = document.getElementById("detail-upload-percent");
+  const progressBar = document.getElementById("detail-upload-progress-bar");
+  
+  if (statusWrap && statusText && percentText && progressBar) {
+    statusWrap.style.display = "block";
+    statusText.style.color = "var(--blue)";
+    statusText.textContent = `⏳ กำลังอ่านไฟล์: ${file.name}...`;
+    percentText.textContent = "0%";
+    progressBar.style.width = "0%";
+  }
+  
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    if (statusText) statusText.textContent = `📤 กำลังอัปโหลดไฟล์ไปที่ Google Drive...`;
+    if (progressBar) progressBar.style.width = "40%";
+    if (percentText) percentText.textContent = "40%";
+    
+    const base64Data = e.target.result.split(',')[1];
+    const fileName = file.name;
+    let mimeType = file.type;
+    
+    if (!mimeType) {
+      const ext = fileName.split('.').pop().toLowerCase();
+      const mimeTypes = {
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'xls': 'application/vnd.ms-excel',
+        'csv': 'text/csv',
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'gif': 'image/gif',
+        'zip': 'application/zip',
+        'txt': 'text/plain'
+      };
+      mimeType = mimeTypes[ext] || 'application/octet-stream';
+    }
+    
+    const uploadRes = await GS.call("uploadFileToDrive", base64Data, fileName, mimeType);
+    if (uploadRes.success) {
+      if (statusText) statusText.textContent = `💾 ไฟล์อัปโหลดสำเร็จ! กำลังปรับปรุงคิวเพื่อเสร็จสิ้นคำขอ...`;
+      if (progressBar) progressBar.style.width = "75%";
+      if (percentText) percentText.textContent = "75%";
+      
+      const adminNoteVal = document.getElementById("detail-upload-admin-note").value.trim() || "จัดทำรายงานเรียบร้อยแล้ว";
+      
+      const updatePayload = {
+        status: "เสร็จสิ้น",
+        downloadUrl: uploadRes.url,
+        adminNote: adminNoteVal
+      };
+      
+      const updateRes = await GS.call("updateRequest", App.currentReq.id, updatePayload, App.user.username, App.user.role);
+      
+      if (updateRes.success) {
+        if (statusText) {
+          statusText.style.color = "var(--green)";
+          statusText.textContent = `✅ ปิดงานสำเร็จ!`;
+        }
+        if (progressBar) progressBar.style.width = "100%";
+        if (percentText) percentText.textContent = "100%";
+        
+        toast("อัปโหลดรายงานและเสร็จสิ้นคำขอแล้ว", "success");
+        setTimeout(() => {
+          closeModal("modal-detail");
+          loadRequests();
+          loadDashboard();
+        }, 800);
+      } else {
+        if (statusText) {
+          statusText.style.color = "var(--red)";
+          statusText.textContent = `❌ ปรับปรุงคิวล้มเหลว: ${updateRes.message}`;
+        }
+        toast("ปรับปรุงคำขอล้มเหลว: " + updateRes.message, "error");
+      }
+    } else {
+      if (statusText) {
+        statusText.style.color = "var(--red)";
+        statusText.textContent = `❌ อัปโหลดล้มเหลว: ${uploadRes.message}`;
+      }
+      toast("อัปโหลดล้มเหลว: " + uploadRes.message, "error");
+    }
+  };
+  
+  reader.onerror = function() {
+    if (statusText) {
+      statusText.style.color = "var(--red)";
+      statusText.textContent = `❌ เกิดข้อผิดพลาดในการอ่านไฟล์`;
+    }
+    toast("เกิดข้อผิดพลาดในการอ่านไฟล์", "error");
+  };
+  
+  reader.readAsDataURL(file);
+}
+
+
+function requestTimeline(r) {
+  const entries = [{ icon:"📝", title:"สร้างคำขอ", time:r.createdAt }];
+  if (r.status !== "รอดำเนินการ") entries.push({ icon:"⚙️", title:r.status === "ปฏิเสธ" ? "คำขอถูกปฏิเสธ" : `อัปเดตสถานะ: ${r.status}`, time:r.updatedAt });
+  if (r.downloadUrl) entries.push({ icon:"📥", title:"แนบไฟล์รายงานพร้อมดาวน์โหลด", time:r.updatedAt });
+  return `<div class="request-timeline">${entries.map((e, i) => `<div class="timeline-entry"><div class="timeline-icon">${e.icon}</div><div><strong>${e.title}</strong><span>${formatThaiDate(e.time)}</span></div>${i < entries.length - 1 ? '<i></i>' : ''}</div>`).join("")}</div>`;
 }
 
 async function analyzeRequestWithAI() {
@@ -878,9 +1264,23 @@ function openEditModal(id) {
   document.getElementById("ed-filter").value   = r.filterCondition || "";
   document.getElementById("ed-note-user").value = r.additionalNote || "";
   
+  // รีเซ็ตการแจ้งสถานะอัปโหลดไฟล์แนบของแอดมิน
+  const statusEl = document.getElementById("ed-file-upload-status");
+  if (statusEl) { statusEl.style.display = "none"; statusEl.textContent = ""; }
+  const fileInput = document.getElementById("ed-file-upload-input");
+  if (fileInput) { fileInput.value = ""; }
+  
   if (isAdmin) {
     if(document.getElementById("ed-status")) document.getElementById("ed-status").value = r.status;
     if(document.getElementById("ed-note")) document.getElementById("ed-note").value = r.adminNote || "";
+    if(document.getElementById("ed-download-url")) document.getElementById("ed-download-url").value = r.downloadUrl || "";
+    if(document.getElementById("ed-status-grp")) document.getElementById("ed-status-grp").style.display = "block";
+    if(document.getElementById("ed-note-grp")) document.getElementById("ed-note-grp").style.display = "block";
+    if(document.getElementById("ed-file-grp")) document.getElementById("ed-file-grp").style.display = "block";
+  } else {
+    if(document.getElementById("ed-status-grp")) document.getElementById("ed-status-grp").style.display = "none";
+    if(document.getElementById("ed-note-grp")) document.getElementById("ed-note-grp").style.display = "none";
+    if(document.getElementById("ed-file-grp")) document.getElementById("ed-file-grp").style.display = "none";
   }
   closeModal("modal-detail");
   openModal("modal-edit");
@@ -907,6 +1307,7 @@ async function saveEdit() {
   if (App.user.role === "admin") {
     payload.status = document.getElementById("ed-status").value;
     payload.adminNote = document.getElementById("ed-note").value;
+    payload.downloadUrl = document.getElementById("ed-download-url").value.trim();
   }
   const res = await GS.call("updateRequest", App.currentReq.id, payload, App.user.username, App.user.role);
   if (res.success) { 
@@ -930,8 +1331,8 @@ async function doDelete() {
   if (res.success) { toast("ลบสำเร็จ", "success"); closeModal("modal-delete"); loadRequests(); loadDashboard(); }
 }
 
-async function submitNewRequest() {
-  const payload = {
+function getNewRequestPayload() {
+  return {
     requesterName:  document.getElementById("nr-name").value.trim(),
     requesterEmail: document.getElementById("nr-email").value.trim(),
     department:     document.getElementById("nr-dept").value,
@@ -948,17 +1349,35 @@ async function submitNewRequest() {
     neededDate:     document.getElementById("nr-needDate").value,
     additionalNote: document.getElementById("nr-note").value.trim()
   };
+}
+
+function validateNewRequest(payload) {
   
-  if (!payload.requesterName) { toast("กรุณากรอกชื่อผู้ขอ", "error"); return; }
-  if (!payload.department) { toast("กรุณาเลือกแผนก/ฝ่าย", "error"); return; }
-  if (!payload.requesterEmail) { toast("กรุณากรอกอีเมล", "error"); return; }
-  if (!payload.reportType) { toast("กรุณากรอกชื่อรายงาน / หัวข้อ", "error"); return; }
-  if (!payload.purpose) { toast("กรุณากรอกวัตถุประสงค์การใช้งาน", "error"); return; }
-  if (!payload.dateFrom || !payload.dateTo) { toast("กรุณากรอกช่วงวันที่ข้อมูลให้ครบ", "error"); return; }
+  if (!payload.requesterName) { toast("กรุณากรอกชื่อผู้ขอ", "error"); return false; }
+  if (!payload.department) { toast("กรุณาเลือกแผนก/ฝ่าย", "error"); return false; }
+  if (!payload.requesterEmail) { toast("กรุณากรอกอีเมล", "error"); return false; }
+  if (!payload.reportType) { toast("กรุณากรอกชื่อรายงาน / หัวข้อ", "error"); return false; }
+  if (!payload.purpose) { toast("กรุณากรอกวัตถุประสงค์การใช้งาน", "error"); return false; }
+  if (!payload.dateFrom || !payload.dateTo) { toast("กรุณากรอกช่วงวันที่ข้อมูลให้ครบ", "error"); return false; }
 
   const from = new Date(payload.dateFrom);
   const to = new Date(payload.dateTo);
-  if (from > to) { toast("วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด", "error"); return; }
+  if (from > to) { toast("วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด", "error"); return false; }
+  return true;
+}
+
+function reviewNewRequest() {
+  const payload = getNewRequestPayload();
+  if (!validateNewRequest(payload)) return;
+  const values = [["ผู้ขอ", payload.requesterName], ["แผนก", payload.department], ["หัวข้อรายงาน", payload.reportType], ["ช่วงข้อมูล", `${formatThaiDate(payload.dateFrom)} ถึง ${formatThaiDate(payload.dateTo)}`], ["ความเร่งด่วน", payload.urgency], ["ต้องการรับ", formatThaiDate(payload.neededDate)], ["วัตถุประสงค์", payload.purpose], ["Fields / คอลัมน์", payload.requestedFields || "ไม่ได้ระบุ"], ["เงื่อนไข Filter", payload.filterCondition || "ไม่ได้ระบุ"]];
+  document.getElementById("review-content").innerHTML = values.map(([label, value], i) => `<div class="review-item ${i > 5 ? 'full' : ''}"><label>${label}</label><div>${value}</div></div>`).join("");
+  openModal("modal-review");
+}
+
+async function submitNewRequest() {
+  const payload = getNewRequestPayload();
+  if (!validateNewRequest(payload)) return;
+  closeModal("modal-review");
 
   document.getElementById("nr-submit-btn").disabled = true;
   document.getElementById("nr-submit-btn").innerHTML = 'กำลังส่งคำขอ... <div class="spinner" style="display:inline-block; width:14px; height:14px; border-width:2px; vertical-align:middle;"></div>';
@@ -966,18 +1385,20 @@ async function submitNewRequest() {
   const res = await GS.call("createRequest", payload, App.user.username);
   
   document.getElementById("nr-submit-btn").disabled = false;
-  document.getElementById("nr-submit-btn").innerHTML = '📤 ส่งคำขอรายงาน';
+  document.getElementById("nr-submit-btn").innerHTML = 'ตรวจทานก่อนส่ง';
   
   if (res.success) {
     document.getElementById("new-req-form").style.display = "none";
     document.getElementById("nr-success").style.display = "block";
     document.getElementById("nr-success-msg").innerHTML = `
-      <strong>Ticket ID ของคุณคือ:</strong> <span class="ticket-pill" style="background:var(--green); color:#fff; padding:2px 8px; border-radius:4px; font-weight:700;">${res.requestNo}</span><br>
+      <strong>Ticket ID ของคุณคือ:</strong> <span class="ticket-pill" style="background:var(--green); color:#fff; padding:2px 8px; border-radius:4px; font-weight:700;">${res.requestNo}</span>
+      <button type="button" class="btn btn-secondary btn-sm" style="margin-left:8px; min-height:auto; padding:4px 8px;" onclick="copyTicketId('${res.requestNo}')">📋 คัดลอก</button><br>
       ระบบได้ส่งอีเมลยืนยันการรับคำขอไปยัง <strong>${payload.requesterEmail}</strong> เรียบร้อยแล้ว<br>
       ทีมไอทีจะทำการดำเนินการและติดต่อกลับภายในกำหนดเวลา
     `;
     toast("ส่งคำขอเรียบร้อยแล้ว", "success");
     loadDashboard();
+    loadRequests();
   } else {
     toast(res.message || "เกิดข้อผิดพลาดในการส่งข้อมูล", "error");
   }
@@ -1254,6 +1675,188 @@ async function loadLogs() {
 }
 
 // ============================================================
+//  12.1 INBOX ENGINE
+// ============================================================
+async function loadInbox() {
+  const list = document.getElementById("inbox-list");
+  if (!list) return;
+  
+  list.innerHTML = `
+    <div style="grid-column: 1/-1; text-align: center; padding: 40px 0;">
+      <div class="spinner" style="margin: 0 auto 16px;"></div>
+      <div style="color: var(--gray-600); font-weight: 500;">กำลังโหลดกล่องรับเข้าไฟล์...</div>
+    </div>
+  `;
+  
+  const res = await GS.call("getRequests", App.user.username, App.user.role, App.user.displayName);
+  if (!res.success) {
+    list.innerHTML = `<div style="grid-column: 1/-1;" class="empty-state">⚠️ เกิดข้อผิดพลาด: ${res.message}</div>`;
+    return;
+  }
+  
+  App.requests = res.data;
+  renderInbox();
+}
+
+function renderInbox() {
+  const list = document.getElementById("inbox-list");
+  if (!list) return;
+  
+  const isAdmin = App.user.role === "admin";
+  
+  const rows = App.requests.filter(r => {
+    const isOwner = (r.createdBy === App.user.displayName || String(r.createdBy).trim() === String(App.user.username).trim() || r.requesterName === App.user.displayName);
+    const isCompleted = r.status === "เสร็จสิ้น";
+    const hasUrl = !!r.downloadUrl;
+    return (isAdmin || isOwner) && isCompleted && hasUrl;
+  });
+  
+  if (rows.length === 0) {
+    list.innerHTML = `
+      <div style="grid-column: 1/-1;" class="empty-state">
+        <div style="font-size: 48px; margin-bottom: 16px;">📥</div>
+        <h4 style="margin-bottom: 8px; color: var(--gray-800);">กล่องรับเข้าไฟล์ว่างเปล่า</h4>
+        <p style="color: var(--gray-400); font-size: 13.5px; max-width: 400px; margin: 0 auto;">
+          เมื่อผู้ดูแลระบบจัดทำรายงานและแนบไฟล์เสร็จสิ้น ลิงก์ดาวน์โหลดจะปรากฏที่นี่เพื่อความสะดวกในการรับไฟล์ของคุณ
+        </p>
+      </div>
+    `;
+    return;
+  }
+  
+  rows.sort((a, b) => new Date(b.updatedAt || b.createdAt) - new Date(a.updatedAt || a.createdAt));
+  
+  list.innerHTML = rows.map(r => {
+    const fileFormatText = r.fileFormat ? `รูปแบบไฟล์: ${r.fileFormat}` : 'ไม่ระบุรูปแบบ';
+    const dateText = formatDate(r.updatedAt || r.createdAt);
+    const ownerBadge = (isAdmin && r.requesterName) ? `<span class="badge" style="background-color: var(--blue-bg); color: var(--blue); margin-bottom: 8px; display: inline-block; font-size: 11px;">👤 ผู้ขอ: ${r.requesterName}</span>` : '';
+    
+    return `
+      <div class="inbox-card">
+        <div>
+          <div class="inbox-card-header">
+            <span class="req-no" style="font-size: 13px;">${r.requestNo}</span>
+            <span style="font-size: 11px; font-weight: 700; color: var(--green); display: flex; align-items: center; gap: 4px;">
+              <span class="recent-dot" style="background: var(--green); margin: 0;"></span> เสร็จสิ้น
+            </span>
+          </div>
+          <div class="inbox-card-title">${r.reportType}</div>
+          ${ownerBadge}
+          <div class="inbox-card-meta">
+            <span>📅 ส่งมอบเมื่อ: ${dateText}</span>
+            <span>📂 ${fileFormatText}</span>
+          </div>
+          ${r.adminNote ? `<div class="inbox-card-note">${r.adminNote}</div>` : ''}
+        </div>
+        <div class="inbox-card-actions">
+          <a href="${r.downloadUrl}" target="_blank" class="inbox-btn-download" onclick="writeLogDownload('${r.requestNo}')">
+            💾 ดาวน์โหลดไฟล์รายงาน
+          </a>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function writeLogDownload(reqNo) {
+  GS.call("writeLog", App.user.username, "DOWNLOAD", "ดาวน์โหลดไฟล์คำขอ " + reqNo);
+}
+
+function handleAdminFileUpload(input) {
+  const file = input.files[0];
+  if (!file) return;
+  
+  if (file.size > 25 * 1024 * 1024) { // จำกัด 25 MB
+    toast("ขนาดไฟล์ใหญ่เกินไป (จำกัดไม่เกิน 25MB)", "error");
+    input.value = "";
+    return;
+  }
+  
+  const statusEl = document.getElementById("ed-file-upload-status");
+  if (statusEl) {
+    statusEl.style.display = "block";
+    statusEl.style.color = "var(--blue)";
+    statusEl.textContent = `⏳ กำลังอัปโหลดไฟล์: ${file.name} (${formatBytes(file.size)})...`;
+  }
+  
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    const base64Data = e.target.result.split(',')[1];
+    const fileName = file.name;
+    let mimeType = file.type;
+    
+    // Fallback สำหรับ MIME type ว่าง (กรณีเบราว์เซอร์หรือเครื่องใช้งานไม่รู้จักนามสกุลไฟล์)
+    if (!mimeType) {
+      const ext = fileName.split('.').pop().toLowerCase();
+      const mimeTypes = {
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'xls': 'application/vnd.ms-excel',
+        'csv': 'text/csv',
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'gif': 'image/gif',
+        'zip': 'application/zip',
+        'txt': 'text/plain'
+      };
+      mimeType = mimeTypes[ext] || 'application/octet-stream';
+    }
+    
+    const res = await GS.call("uploadFileToDrive", base64Data, fileName, mimeType);
+    if (res.success) {
+      if (statusEl) {
+        statusEl.style.color = "var(--green)";
+        statusEl.textContent = `✅ อัปโหลดสำเร็จ!`;
+      }
+      const urlInput = document.getElementById("ed-download-url");
+      if (urlInput) {
+        urlInput.value = res.url;
+      }
+      toast("อัปโหลดไฟล์เสร็จสิ้นและแนบลิงก์แล้ว", "success");
+    } else {
+      if (statusEl) {
+        statusEl.style.color = "var(--red)";
+        statusEl.textContent = `❌ อัปโหลดล้มเหลว: ${res.message}`;
+      }
+      toast("อัปโหลดล้มเหลว: " + res.message, "error");
+    }
+  };
+  reader.onerror = function() {
+    if (statusEl) {
+      statusEl.style.color = "var(--red)";
+      statusEl.textContent = `❌ เกิดข้อผิดพลาดในการอ่านไฟล์`;
+    }
+    toast("เกิดข้อผิดพลาดในการอ่านไฟล์", "error");
+  };
+  reader.readAsDataURL(file);
+}
+
+function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// --- THEME MANAGEMENT ---------------------------------------
+function initTheme() {
+  const savedTheme = localStorage.getItem("theme");
+  if (savedTheme === "dark") {
+    document.body.classList.add("dark-theme");
+  }
+}
+
+function toggleTheme() {
+  const isDark = document.body.classList.toggle("dark-theme");
+  localStorage.setItem("theme", isDark ? "dark" : "light");
+}
+
+// ============================================================
 //  13. SYSTEM INITIALIZATION & EVENT SAFETY BINDING
 // ============================================================
 document.addEventListener("DOMContentLoaded", () => {
@@ -1267,6 +1870,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function safeEvent(id, type, cb) { const el = document.getElementById(id); if (el) el.addEventListener(type, cb); }
 
+  // ผูกตัวดักเหตุการณ์การจัดการธีม
+  initTheme();
+  safeEvent("theme-toggle-btn", "click", toggleTheme);
+
   // ผูกตัวดักเหตุการณ์หน้าล็อกอิน
   safeEvent("login-btn", "click", doLogin);
   safeEvent("logout-btn", "click", logout);
@@ -1275,14 +1882,33 @@ document.addEventListener("DOMContentLoaded", () => {
   safeEvent("pdf-download-btn", "click", downloadPdf);
   safeEvent("email-send-btn", "click", sendEmail);
   safeEvent("delete-confirm-btn", "click", doDelete);
-  safeEvent("nr-submit-btn", "click", submitNewRequest);
+  safeEvent("nr-submit-btn", "click", reviewNewRequest);
+  safeEvent("review-confirm-btn", "click", submitNewRequest);
   safeEvent("nr-reset-btn", "click", resetNewRequest);
   safeEvent("nr-new-btn", "click", () => { resetNewRequest(); });
   safeEvent("logs-refresh-btn", "click", loadLogs);
   safeEvent("btn-download-csv", "click", downloadMonthlyReport);
-  safeEvent("search-input", "input", e => { App.searchQuery = e.target.value; renderTable(); });
-  safeEvent("filter-status", "change", e => { App.filterStatus = e.target.value; renderTable(); });
-  safeEvent("filter-dept", "change", e => { App.filterDept = e.target.value; renderTable(); });
+  safeEvent("search-input", "input", e => { App.searchQuery = e.target.value; App.requestPage = 1; renderTable(); });
+  safeEvent("filter-status", "change", e => { App.filterStatus = e.target.value; App.requestPage = 1; renderTable(); });
+  safeEvent("filter-dept", "change", e => { App.filterDept = e.target.value; App.requestPage = 1; renderTable(); });
+  safeEvent("sort-requests", "change", e => { App.sortRequests = e.target.value; App.requestPage = 1; saveRequestPreferences(); renderTable(); });
+  safeEvent("notification-btn", "click", () => { renderNotifications(); openModal("modal-notifications"); });
+  document.querySelectorAll(".quick-filter").forEach(btn => btn.addEventListener("click", () => { App.quickFilter = App.quickFilter === btn.dataset.quickFilter ? "" : btn.dataset.quickFilter; App.requestPage = 1; saveRequestPreferences(); renderTable(); }));
+  const templates = {
+    opd: { type:"รายงานสรุปผู้ป่วยนอก (OPD) รายเดือน", purpose:"ใช้สรุปผลการให้บริการผู้ป่วยนอกประจำเดือน", fields:"HN, วันที่รับบริการ, คลินิก, สิทธิการรักษา, วินิจฉัยโรค (ICD-10)", data:"ผู้ป่วยนอก (OPD)", format:"Excel (.xlsx)" },
+    ipd: { type:"รายงานสรุปผู้ป่วยใน (IPD) รายเดือน", purpose:"ใช้สรุปผลการให้บริการผู้ป่วยในประจำเดือน", fields:"AN, HN, วันที่รับ/จำหน่าย, หอผู้ป่วย, สิทธิการรักษา, วินิจฉัยโรค", data:"ผู้ป่วยใน (IPD)", format:"Excel (.xlsx)" },
+    custom: { type:"", purpose:"", fields:"", data:"", format:"" }
+  };
+  document.querySelectorAll(".template-btn").forEach(btn => btn.addEventListener("click", () => {
+    const t = templates[btn.dataset.template];
+    ["nr-type", "nr-purpose", "nr-fields"].forEach((id, i) => document.getElementById(id).value = [t.type, t.purpose, t.fields][i]);
+    document.querySelectorAll("#nr-dataTypeGroup .chip, #nr-formatGroup .chip").forEach(c => c.classList.toggle("active", c.textContent.trim() === t.data || c.textContent.trim() === t.format));
+    updateFormStepsProgress();
+  }));
+  document.querySelectorAll(".priority-card").forEach(card => card.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); card.click(); }
+  }));
+  restoreRequestPreferences();
 
   // ผูกตัวดักเหตุการณ์หน้าแสดงรายละเอียด (Detail Modal)
   safeEvent("detail-pdf-btn", "click", () => openPdfModal(null));
@@ -1302,9 +1928,10 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   try {
-    const su = localStorage.getItem("hosxp_username"); const sp = localStorage.getItem("hosxp_password");
-    if (su && sp) {
-      document.getElementById("login-username").value = su; document.getElementById("login-password").value = sp;
+    const su = localStorage.getItem("hosxp_username");
+    localStorage.removeItem("hosxp_password");
+    if (su) {
+      document.getElementById("login-username").value = su;
       document.getElementById("login-remember").checked = true;
     }
   } catch(e){}

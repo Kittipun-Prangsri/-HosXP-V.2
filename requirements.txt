@@ -1,3 +1,5 @@
 pyTelegramBotAPI
-google-generativeai
-pillow
+mysql-connector-python
+pandas
+openpyxl
+requests
