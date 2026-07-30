@@ -16,19 +16,19 @@ if os.path.exists(".env"):
                 except ValueError:
                     pass
 
-# 2. ตั้งค่าดึงข้อมูล API Keys (ดึงจาก env หรือใช้ค่าเริ่มต้นจากเครื่องของคุณ)
+# 2. ตั้งค่าดึงข้อมูล API Keys (ดึงจาก .env เท่านั้น - ห้ามฝัง Key ในโค้ด)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "your_telegram_bot_token_here":
-    TELEGRAM_TOKEN = "8861354099:AAH2g-fFEqJ4J105542KrTrImnIe-vKFQNM"
-
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("⚠️ คำเตือน: กรุณาตั้งค่า Environment Variables: TELEGRAM_BOT_TOKEN และ GEMINI_API_KEY")
+if not TELEGRAM_TOKEN:
+    print("❌ ข้อผิดพลาด: กรุณาตั้งค่า TELEGRAM_BOT_TOKEN ในไฟล์ .env")
+    exit(1)
+if not GEMINI_API_KEY:
+    print("❌ ข้อผิดพลาด: กรุณาตั้งค่า GEMINI_API_KEY ในไฟล์ .env")
+    exit(1)
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+genai.configure(api_key=GEMINI_API_KEY)
 
 
 # 2. โหลด System Prompt สำหรับบอท HosXP (เวอร์ชันปรับปรุงอย่างละเอียด)
