@@ -4,8 +4,10 @@
 import os
 import sys
 import re
+import time
 import mysql.connector
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # ตรวจสอบแพ็คเกจช่วยจัดรูปแบบตาราง (ถ้ามีให้เรียกใช้ ถ้าไม่มีให้ใช้ระบบจัดฟอร์แมตสำรอง)
 try:
@@ -53,8 +55,8 @@ DB_NAME = os.environ.get("HOSXP_DB_NAME", "hosxp")
 DB_USER = os.environ.get("HOSXP_DB_USER", "root")
 DB_PASS = os.environ.get("HOSXP_DB_PASS", "")
 
-# ตั้งค่าเชื่อมต่อ Google Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+# ตั้งค่าเชื่อมต่อ Google Gemini (SDK ใหม่)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ======================================================================
 # บริบทโครงสร้างตาราง HOSxP สำหรับเทรน AI บรรทัดต่อบรรทัด
@@ -91,24 +93,44 @@ SELECT ...
 """
 
 def generate_sql(prompt):
-    """ส่งข้อความความต้องการไปวิเคราะห์ผ่าน Gemini AI"""
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash-lite', system_instruction=SYSTEM_PROMPT)
-        response = model.generate_content(prompt)
-        text = response.text.strip()
-        
-        # ค้นหาบล็อกโค้ดในกรณีที่ตอบกลับมาพร้อมข้อความอื่น
-        match = re.search(r"```sql\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        
-        # ป้องกันหลุดการครอบบล็อกแต่วัตถุประสงค์ขึ้นต้นด้วย SQL ตรงๆ
-        if text.lower().startswith("select") or text.lower().startswith("with"):
-            return text
-            
-        return text
-    except Exception as e:
-        return f"เกิดข้อผิดพลาดด้าน AI: {e}"
+    """ส่งข้อความความต้องการไปวิเคราะห์ผ่าน Gemini AI (พร้อม retry อัตโนมัติ)"""
+    models_to_try = ['gemini-2.0-flash-lite', 'gemini-2.0-flash', 'gemini-2.5-flash']
+    
+    for model_name in models_to_try:
+        for attempt in range(3):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.1,
+                    )
+                )
+                text = response.text.strip()
+                
+                # ค้นหาบล็อกโค้ดในกรณีที่ตอบกลับมาพร้อมข้อความอื่น
+                match = re.search(r"```sql\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+                if match:
+                    return match.group(1).strip()
+                if text.lower().startswith("select") or text.lower().startswith("with"):
+                    return text
+                return text
+                
+            except Exception as e:
+                err_str = str(e)
+                if '429' in err_str and attempt < 2:
+                    wait = (attempt + 1) * 10
+                    print(f"{Colors.WARNING}⚠️ โมเดล {model_name} quota เต็ม รอ {wait} วินาที...{Colors.ENDC}")
+                    time.sleep(wait)
+                    continue
+                elif '429' in err_str:
+                    print(f"{Colors.WARNING}⚠️ โมเดล {model_name} quota หมด เปลี่ยนโมเดลถัดไป...{Colors.ENDC}")
+                    break
+                else:
+                    return f"เกิดข้อผิดพลาดด้าน AI: {e}"
+    
+    return "เกิดข้อผิดพลาดด้าน AI: quota ของทุกโมเดลหมดแล้ว กรุณารอถึงพรุ่งนี้หรือสร้าง API Key ใหม่จาก AI Studio"
 
 def execute_query(sql):
     """รันคำสั่ง SQL จริงบนฐานข้อมูล HOSxP พร้อมดึงข้อมูลแสดงผลแบบตาราง"""
